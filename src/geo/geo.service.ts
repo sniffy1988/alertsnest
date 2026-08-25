@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { KHARKIV_CENTER, type PlaceKind } from './ua-gazetteer';
 import { ToponymService, type MemoryToponym } from './toponym.service';
-import { detectOblastRegion, findOutsideCities, isVagueOblastName, mentionedIn } from './place-match';
+import { detectOblastRegion, findOutsideCities, isVagueOblastName, mentionedIn, mentionsAdminRaion } from './place-match';
 
 export type ResolvedPlace = {
   name: string;
@@ -19,11 +19,11 @@ export type ThreatPlaceResolve = {
 
 const CITY_RADIUS_KM = 22;
 const NEARBY_KM: Record<PlaceKind, number> = {
-  street: 4,
-  district: 4,
-  city: 22,
-  settlement: 8,
-  region: 12,
+  street: 1.2,
+  district: 2,
+  city: 8,
+  settlement: 3,
+  region: 4,
 };
 
 @Injectable()
@@ -64,14 +64,16 @@ export class GeoService {
     geoScope?: string | null;
   }): Promise<ThreatPlaceResolve> {
     const region = detectOblastRegion(input.text);
-    const fromText = this.toponyms.findInText(input.text);
+    const raionOnly = mentionsAdminRaion(input.text);
+    const fromText = this.toponyms.findInText(input.text).filter((p) => !raionOnly || p.kind !== 'street');
     const groundedLlm = input.llmPlaces.filter(
       (name) => !isVagueOblastName(name) && mentionedIn(input.text, name),
     );
     const lookedUp = input.llmPlaces
       .filter((name) => !isVagueOblastName(name))
       .map((name) => this.toponyms.lookup(name))
-      .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name));
+      .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name))
+      .filter((hit) => !raionOnly || hit.kind !== 'street');
 
     const foreign = findOutsideCities(input.text, input.llmPlaces);
     const names: string[] = [];

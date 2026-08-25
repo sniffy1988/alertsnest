@@ -156,6 +156,10 @@ export function looksLikeSettlement(name: string): boolean {
   return /(івка|ивка|овка|евка|янка|инка|ево|ово)\b/.test(n) && !/(вул|просп|майдан|шосе)/.test(n);
 }
 
+export function mentionsAdminRaion(text: string): boolean {
+  return /[а-я]{3,}ськ[иі]й\s+район|[а-я]{3,}ск[иі]й\s+район/.test(foldUa(text));
+}
+
 export function isVagueOblastName(name: string): boolean {
   const n = foldUa(name);
   return (

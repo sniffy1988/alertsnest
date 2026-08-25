@@ -9,6 +9,7 @@ import {
   foldUa,
   inKharkivOblast,
   looksLikeSettlement,
+  mentionsAdminRaion,
   namesEqual,
   nominativeGuesses,
   OBLAST_BBOX,
@@ -118,8 +119,10 @@ export class ToponymService implements OnModuleInit {
     const tokens = folded.split(' ').filter(Boolean);
     const hits = new Map<number, MemoryToponym>();
     const scored: Array<{ item: MemoryToponym; len: number }> = [];
+    const raionOnly = mentionsAdminRaion(text);
 
     for (const item of this.items) {
+      if (raionOnly && item.kind === 'street') continue;
       const labels = [item.name, item.norm, ...item.aliases];
       for (const label of labels) {
         const phrase = foldUa(label);
