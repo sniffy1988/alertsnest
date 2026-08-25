@@ -1,5 +1,5 @@
 import { normalize } from '../common/text';
-import { isContinuation, isEtaOnly, isTrackLost, leftOblast } from '../alerts/message-chain';
+import { isAllClearPost, isContinuation, isEtaOnly, isTrackLost, leftOblast } from '../alerts/message-chain';
 import { isForeignOnlyThreat } from '../geo/place-match';
 
 export type ThreatKind =
@@ -19,6 +19,7 @@ export type ThreatKind =
   | 'jet_uav'
   | 'strike_uav'
   | 'all_clear'
+  | 'none'
   | 'other';
 
 export const THREAT_LABELS: Record<ThreatKind, { ua: string; ru: string; en: string }> = {
@@ -38,6 +39,7 @@ export const THREAT_LABELS: Record<ThreatKind, { ua: string; ru: string; en: str
   jet_uav: { ua: 'Реактивний БПЛА', ru: 'Реактивный БПЛА', en: 'Jet UAV' },
   strike_uav: { ua: 'Ударний БПЛА', ru: 'Ударный БПЛА', en: 'Strike UAV' },
   all_clear: { ua: 'Відбій / чисто', ru: 'Отбой / чисто', en: 'All clear' },
+  none: { ua: 'Не загроза', ru: 'Не угроза', en: 'Not a threat' },
   other: { ua: 'Загроза', ru: 'Угроза', en: 'Threat' },
 };
 
@@ -48,6 +50,7 @@ const SLANG: Array<{ needles: string[]; type: ThreatKind; allClear?: boolean }> 
   { needles: ['ударний бпла', 'ударный бпла', 'ударний на', 'ударный на'], type: 'strike_uav' },
   { needles: ['кинжал', 'кинджал', 'кінжал'], type: 'kinzhal' },
   { needles: ['іскандер-к', 'искандер-к', 'калибр', 'калібр', 'онікс', 'оникс', 'крилата', 'крылата'], type: 'cruise' },
+  { needles: ['орешник', 'орешника', 'oreshnik'], type: 'ballistic' },
   { needles: ['баліст', 'баллист', 'іскандер', 'искандер'], type: 'ballistic' },
   { needles: ['-59', 'х-59', 'х59', 'x-59', 'x59'], type: 'kh59' },
   { needles: ['каб', 'кабы', 'фаб', 'умпк', 'умпк'], type: 'kab' },
@@ -79,6 +82,38 @@ export function detectThreatSlang(text: string): { type: ThreatKind; allClear: b
   return null;
 }
 
+/** True when a "place" string is really a weapon / alert word, not a toponym. */
+export function isThreatLabel(name: string): boolean {
+  const n = normalize(name)
+    .replace(/[''`ʼ]/g, '')
+    .replace(/[ъь]/g, '')
+    .replace(/і/g, 'и')
+    .replace(/ї/g, 'и')
+    .replace(/є/g, 'е')
+    .replace(/ґ/g, 'г')
+    .replace(/ё/g, 'е')
+    .replace(/[^a-zа-я0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!n || n.length < 3) return true;
+  if (
+    /^(балист\w*|баллист\w*|шахед\w*|мопед\w*|геран\w*|кинжал\w*|кинджал\w*|орешник\w*|калибр\w*|калібр\w*|іскандер\w*|искандер\w*|ракет\w*|каб\w*|фаб\w*|умпк|бпла\w*|ппо|пво|тривог\w*|тревог\w*|загроз\w*|угроз\w*|повітря|воздух|приліт\w*|прилет\w*|вибух\w*|взрыв\w*|бандерол\w*|oreshnik|shahed|kinzhal|iskander)$/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  // Single declined threat lemma: "баллистике", "орешника"
+  for (const row of SLANG) {
+    if (row.allClear) continue;
+    for (const needle of row.needles) {
+      const stem = normalize(needle).replace(/(ике|ики|ика|ику|ам|ами|ах|ов|ів|ей)?$/i, '').slice(0, 6);
+      if (stem.length >= 4 && n.includes(stem) && n.length <= stem.length + 4) return true;
+    }
+  }
+  return false;
+}
+
 export function enrichThreatType(
   text: string,
   llmType: string | null,
@@ -91,10 +126,11 @@ export function enrichThreatType(
   const chained = context.length > 0 || isContinuation(text);
   const combined = [...context, text].join('\n');
   const slang = detectThreatSlang(chained || trackLost ? combined : text);
-  const weak = !llmType || llmType === 'other' || llmType === 'all_clear';
+  const textAllClear = isAllClearPost(text) || isAllClearPost(combined);
+  const weak = !llmType || llmType === 'other' || llmType === 'all_clear' || llmType === 'none';
   if (slang) {
     const type = weak ? slang.type : llmType;
-    const allClear = !trackLost && !left && (slang.allClear || type === 'all_clear');
+    const allClear = !trackLost && !left && (slang.allClear || textAllClear);
     return {
       threatType: allClear ? 'all_clear' : type,
       isThreat: !allClear,
@@ -103,9 +139,10 @@ export function enrichThreatType(
       trackLost: trackLost || left,
     };
   }
-  const allClear = !trackLost && !left && llmType === 'all_clear';
+  const allClear = !trackLost && !left && textAllClear;
+  const empty = !allClear && !llmIsThreat && !trackLost && !chained;
   return {
-    threatType: llmType ?? 'other',
+    threatType: allClear ? 'all_clear' : empty ? 'none' : (llmType && llmType !== 'all_clear' ? llmType : 'other'),
     isThreat: allClear ? false : llmIsThreat || trackLost || chained,
     notify: !left && !foreign && !isEtaOnly(text) && (allClear || llmIsThreat || trackLost || chained),
     fromSlang: false,

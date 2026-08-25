@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { GeoService, type ResolvedPlace } from '../geo/geo.service';
 import { NotifyService } from '../notify/notify.service';
+import { TelegramService } from '../telegram/telegram.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { escapeHtml, previewMessage } from '../common/text';
 import { t } from '../common/i18n';
@@ -30,6 +31,7 @@ export class AlertsService {
     private readonly prisma: PrismaService,
     private readonly geo: GeoService,
     private readonly notify: NotifyService,
+    private readonly telegram: TelegramService,
     private readonly metrics: MetricsService,
   ) {
     this.concurrency = Math.max(1, Number(config.get('ALERT_SEND_CONCURRENCY') ?? 8));
@@ -80,6 +82,13 @@ export class AlertsService {
     });
     await Promise.all(workers);
     this.metrics.lastAlertAt = new Date().toISOString();
+    void this.telegram.offerPlaceFix({
+      messageId: payload.messageId,
+      channel: payload.channel,
+      text: payload.text,
+      place: payload.places[0]?.name ?? '—',
+      users: targets.length,
+    });
   }
 
   private async sendOne(
@@ -139,7 +148,11 @@ export class AlertsService {
     ].join('\n');
 
     try {
-      const sent = await this.notify.send(user, { html, text });
+      const sent = await this.notify.send(user, {
+        html,
+        text,
+        telegramMarkup: this.telegram.alertWrongPlaceKeyboard(loc, payload.messageId),
+      });
       if (!sent) {
         this.logger.warn(`alert to user ${user.id} skipped: no delivery channel`);
         return;

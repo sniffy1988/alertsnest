@@ -3,7 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { Ollama } from 'ollama';
 import { MetricsService } from '../metrics/metrics.service';
 import { previewMessage } from '../common/text';
-import { enrichThreatType } from './threat-slang';
+import { isPlausiblePlaceLabel, isVagueOblastName } from '../geo/place-match';
+import { enrichThreatType, isThreatLabel } from './threat-slang';
 
 export type LlmInputItem = {
   id: string;
@@ -56,6 +57,7 @@ const RESPONSE_SCHEMA = {
               'jet_uav',
               'strike_uav',
               'all_clear',
+              'none',
               'other',
             ],
           },
@@ -77,8 +79,8 @@ const RESPONSE_SCHEMA = {
 
 const SYSTEM_PROMPT = `Ти аналітик повітряних загроз Харкова і Харківської області. Канали пишуть сленгом.
 threat_type:
-- shahed: шахед, мопед, герань, geran
-- ballistic: балістика, іскандер
+- shahed: шахед, мопед, герань, geran, бандероль
+- ballistic: балістика, іскандер, орешник / орешника
 - cruise: крилата, калибр, іскандер-к, онікс
 - kinzhal: кинжал / кинджал
 - kh59: х-59, -59
@@ -90,16 +92,26 @@ threat_type:
 - recon: дорозвідка, розвідник
 - aircraft: 31к, міг-31, ту-95, стратегічна
 - explosion: приліт, вибух, упав
-- air_raid: повітря / воздух / загроза без типу
+- air_raid: повітря / воздух / тривога без типу зброї
 - sam: наша бойова, ппо
-- all_clear: відбій, отбой, чисто — is_threat=false
+- all_clear: ТІЛЬКИ явні «відбій», «отбой», «укриття знято», «все чисто» — is_threat=false
+- none: новини, реклама, УЗ, підписка, побут — не загроза і не відбій
+Не став all_clear на новини чи просто is_threat=false. Немає «відбій/отбой» → none.
 geo_scope:
 - street / district — назва вулиці або району МІСТА є в тексті
 - city — загроза по всьому Харкову, без конкретного району
 - suburb — передмістя (Пісочин, Дергачі…)
 - oblast — область, смт, села, «північ/схід області», «пригород»
-places: лише топоніми, які РЕАЛЬНО є в тексті. Не вигадуй Наукову, Центр, Салтівку.
+places: ЛИШЕ топоніми (місто, район, вулиця, смт, село). Порожній масив [], якщо топоніма немає.
+ЗАБОРОНЕНО в places: балістика, орешник, шахед, мопед, ракета, каб, бпла, ппо, тривога, загроза, повітря — це threat_type, не місце.
+ЗАБОРОНЕНО в places: «Харківська область», «область», «передмістя», «пригород» без конкретного села.
+Приклади:
+«Загроза балістики‼️» → threat_type=ballistic, places=[], geo_scope=city
+«Угроза Орешника» → threat_type=ballistic, places=[], geo_scope=city
+«Харків та передмістя - повітряна тривога!» → threat_type=air_raid, places=["Харків"], geo_scope=city
+«На Салтівку» → places=["Салтівка"], geo_scope=district
 Краснопавлівка ≠ Павлівка. Кегичівка — область, не вулиця Харкова.
+Сахновщина, Лозова, Краснопавлівка — смт/міста області, не вулиці Харкова. Берестинський район = Красноградський район.
 «північ області / пригород» → geo_scope=oblast, places=["північ області"].
 context — попередні пости гілки (реплай). 1654/СХІD/TLK так ведуть траєкторію.
 Тип загрози з початку ланцюжка. places — з ПОТОЧНОГО тексту (куди далі).
@@ -226,8 +238,8 @@ export class LlmService {
           isThreat: Boolean(row.is_threat),
           severity: typeof row.severity === 'string' ? row.severity : null,
           threatType: typeof row.threat_type === 'string' ? row.threat_type : null,
-          places: Array.isArray(row.places) ? row.places.map(String) : [],
-          oblast: typeof row.oblast === 'string' ? row.oblast : null,
+          places: this.cleanPlaces(Array.isArray(row.places) ? row.places.map(String) : []),
+          oblast: typeof row.oblast === 'string' && !isVagueOblastName(row.oblast) ? row.oblast : null,
           geoScope: typeof row.geo_scope === 'string' ? row.geo_scope : null,
           eventKey: typeof row.event_key === 'string' ? row.event_key : null,
           summaryUk: typeof row.summary_uk === 'string' ? row.summary_uk : null,
@@ -254,19 +266,34 @@ export class LlmService {
         if (enriched.fromSlang) {
           this.logger.log(`slang [${item.id}] ${base.threatType ?? '∅'} → ${enriched.threatType}`);
         }
+        if (base.threatType === 'all_clear' && enriched.threatType !== 'all_clear') {
+          this.logger.log(`drop fake all_clear [${item.id}] → ${enriched.threatType} notify=${enriched.notify}`);
+        }
+        const places = this.cleanPlaces(base.places);
         return {
           ...base,
+          places,
           isThreat: enriched.isThreat,
           threatType: enriched.threatType,
           notify: enriched.notify,
           trackLost: enriched.trackLost,
-          eventKey: base.eventKey ?? `${enriched.threatType}:${base.places[0] ?? 'kharkiv'}`,
+          eventKey: base.eventKey ?? `${enriched.threatType}:${places[0] ?? 'kharkiv'}`,
         };
       });
     } catch (err) {
       this.logger.warn(`JSON parse failed: ${err instanceof Error ? err.message : err} raw=${content.slice(0, 180)}`);
       return null;
     }
+  }
+
+  private cleanPlaces(places: string[]): string[] {
+    return [
+      ...new Set(
+        places
+          .map((p) => p.trim())
+          .filter((p) => p.length >= 2 && isPlausiblePlaceLabel(p) && !isThreatLabel(p)),
+      ),
+    ];
   }
 
   private async lock(): Promise<void> {

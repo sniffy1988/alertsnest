@@ -1,7 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { KHARKIV_CENTER, type PlaceKind } from './ua-gazetteer';
 import { ToponymService, type MemoryToponym } from './toponym.service';
-import { detectOblastRegion, findOutsideCities, isVagueOblastName, mentionedIn, mentionsAdminRaion } from './place-match';
+import {
+  detectOblastRegion,
+  dropStreetShadows,
+  findOutsideCities,
+  foldUa,
+  isCityWideKharkivCue,
+  isPlausiblePlaceLabel,
+  isVagueOblastName,
+  mentionedIn,
+  mentionsAdminRaion,
+  queryLooksLikeStreet,
+} from './place-match';
+import { isThreatLabel } from '../llm/threat-slang';
 
 export type ResolvedPlace = {
   name: string;
@@ -65,35 +77,64 @@ export class GeoService {
   }): Promise<ThreatPlaceResolve> {
     const region = detectOblastRegion(input.text);
     const raionOnly = mentionsAdminRaion(input.text);
-    const fromText = this.toponyms.findInText(input.text).filter((p) => !raionOnly || p.kind !== 'street');
-    const groundedLlm = input.llmPlaces.filter(
+    const llmPlaces = input.llmPlaces.filter(
+      (name) => isPlausiblePlaceLabel(name) && !isThreatLabel(name),
+    );
+    const fromText = dropStreetShadows(
+      this.toponyms.findInText(input.text).filter((p) => !raionOnly || p.kind !== 'street'),
+      input.text,
+    );
+    const groundedLlm = llmPlaces.filter(
       (name) => !isVagueOblastName(name) && mentionedIn(input.text, name),
     );
-    const lookedUp = input.llmPlaces
-      .filter((name) => !isVagueOblastName(name))
-      .map((name) => this.toponyms.lookup(name))
-      .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name))
-      .filter((hit) => !raionOnly || hit.kind !== 'street');
+    const lookedUp = dropStreetShadows(
+      llmPlaces
+        .filter((name) => !isVagueOblastName(name))
+        .map((name) => this.toponyms.lookup(name))
+        .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name))
+        .filter((hit) => !raionOnly || hit.kind !== 'street'),
+      input.text,
+    );
 
-    const foreign = findOutsideCities(input.text, input.llmPlaces);
+    const foreign = findOutsideCities(input.text, llmPlaces);
     const names: string[] = [];
     names.push(...fromText.map((p) => p.name));
     names.push(...lookedUp.map((p) => p.name));
-    names.push(...groundedLlm.filter((name) => !this.toponyms.lookup(name) && !findOutsideCities(name).length));
+    names.push(
+      ...groundedLlm.filter(
+        (name) =>
+          isPlausiblePlaceLabel(name) &&
+          !isThreatLabel(name) &&
+          !this.toponyms.lookup(name) &&
+          !findOutsideCities(name).length,
+      ),
+    );
     if (region) names.unshift(region.name);
     if (input.oblast && !isVagueOblastName(input.oblast) && mentionedIn(input.text, input.oblast)) {
       names.push(input.oblast);
     }
 
-    const uniqueNames = [...new Set(names.map((n) => n.trim()).filter((n) => n.length >= 3))];
-    const cityHint = this.toponyms.lookup('Харків');
-    const learned = uniqueNames.length ? await this.toponyms.learn(uniqueNames, cityHint) : [];
+    const uniqueNames = [
+      ...new Set(
+        names
+          .map((n) => n.trim())
+          .filter((n) => n.length >= 3 && isPlausiblePlaceLabel(n) && !isThreatLabel(n)),
+      ),
+    ];
+    const known = uniqueNames
+      .map((name) => this.toponyms.lookup(name))
+      .filter((hit): hit is NonNullable<typeof hit> => hit != null);
+    const hint =
+      known.find((p) => p.kind === 'settlement' || p.kind === 'region' || p.kind === 'district') ??
+      known[0] ??
+      this.toponyms.lookup('Харків');
+    const learned = uniqueNames.length ? await this.toponyms.learn(uniqueNames, hint) : [];
     const unique = new Map<number, ResolvedPlace>();
     const unknown: string[] = [];
     for (const item of learned) {
       if (item.status === 'local') unique.set(item.place.id, this.toResolved(item.place));
       else if (item.status === 'foreign') foreign.push(item.label);
-      else unknown.push(item.label);
+      else if (isPlausiblePlaceLabel(item.label) && !isThreatLabel(item.label)) unknown.push(item.label);
     }
     if (region && ![...unique.values()].some((p) => p.code === region.code || p.matchType === 'region')) {
       unique.set(-1, {
@@ -105,7 +146,9 @@ export class GeoService {
       });
     }
 
-    let places = [...unique.values()];
+    let places = dropStreetShadows([...unique.values()], input.text);
+    places = this.dropCityAdjectiveStreets(places, input.text);
+
     const cityPlacesInText = fromText.some((p) => p.kind === 'street' || p.kind === 'district');
     const precise = places.filter((p) => p.matchType !== 'city');
     if (precise.length) places = precise;
@@ -113,11 +156,31 @@ export class GeoService {
       const outer = places.filter((p) => p.matchType === 'settlement' || p.matchType === 'region');
       if (outer.length) places = outer;
     }
+
+    const cityWide =
+      isCityWideKharkivCue(input.text) ||
+      (input.geoScope === 'city' && /харк|харьков|kharkiv/i.test(foldUa(input.text)));
+
+    if (!places.length && cityWide) {
+      const city = this.toponyms.lookup('Харків');
+      if (city) places = [this.toResolved(city)];
+    }
+
     return {
       places,
       foreign: [...new Set(foreign)],
       unknown: [...new Set(unknown)],
     };
+  }
+
+  /** «Харківська вулиця» from geocoding «Харківська» — not a real street mention. */
+  private dropCityAdjectiveStreets(places: ResolvedPlace[], text: string): ResolvedPlace[] {
+    if (queryLooksLikeStreet(text)) return places;
+    return places.filter((place) => {
+      if (place.matchType !== 'street') return true;
+      const n = foldUa(place.name);
+      return !/^(вул\.?\s*)?(харківськ|харьковск)/.test(n);
+    });
   }
 
   async resolveAndLearn(names: string[], oblast?: string | null): Promise<ResolvedPlace[]> {

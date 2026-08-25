@@ -35,9 +35,16 @@ export function isEtaOnly(text: string): boolean {
   return /підлітн|подлетн|підлітний час|eta/.test(n) && !/\b(дали|далее|курс)\b/.test(n);
 }
 
+const ALL_CLEAR_RE =
+  /(видбий|відбій|отбой|укриття знят|укрытие снят|все чисто|усе чисто|повітря чисто|воздух чисто|тривог[уи] скасован|тревог[уи] отмен)/;
+
+export function isAllClearPost(text: string): boolean {
+  return ALL_CLEAR_RE.test(foldUa(text));
+}
+
 export function isNoisePost(text: string): boolean {
   const n = foldUa(text);
-  if (/(видбий|відбій|отбой|укриття знят|укрытие снят|все чисто|усе чисто)/.test(n)) {
+  if (isAllClearPost(text)) {
     return false;
   }
   if (/monobank|privatbank|send monobank|підтримка по бажан|поддержка по желанию|картка|конверт/.test(n)) {

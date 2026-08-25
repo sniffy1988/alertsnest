@@ -7,6 +7,7 @@ import { AlertsService } from './alerts.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { MetricsService } from '../metrics/metrics.service';
 import {
+  isAllClearPost,
   isContinuation,
   isEtaOnly,
   isNoisePost,
@@ -15,6 +16,8 @@ import {
   type ChainMessage,
 } from './message-chain';
 import { ALERT_DEDUP_MS, canonicalEventKey, eventKeysOverlap } from './event-key';
+import { isCityWideKharkivCue, isPlausiblePlaceLabel } from '../geo/place-match';
+import { isThreatLabel } from '../llm/threat-slang';
 
 export type BufferedMessage = {
   dbId: number;
@@ -138,7 +141,7 @@ export class PipelineService {
                   geoScope: analysis.geoScope,
                 })
               : { places: [], foreign: [], unknown: [] };
-        const places = resolved.places;
+        const places = [...resolved.places];
 
         const storedKey =
           places.length > 0
@@ -174,18 +177,37 @@ export class PipelineService {
         }
 
         if (!analysis.notify) continue;
+        if (analysis.threatType === 'all_clear' && !isAllClearPost(item.text)) {
+          this.logger.log(`msg ${item.dbId} all_clear without відбій/отбой, skip`);
+          continue;
+        }
         if (resolved.foreign.length && places.length === 0) {
           this.logger.log(`msg ${item.dbId} other city [${resolved.foreign.join(', ')}], skip`);
           continue;
         }
         if (places.length === 0) {
-          this.logger.warn(`msg ${item.dbId} threat without resolved places, skip alert`);
-          void this.telegram.askUnknownToponym({
-            channel: item.channel,
-            text: item.text,
-            guesses: analysis.places.length ? analysis.places : resolved.unknown,
-          });
-          continue;
+          const guesses = (analysis.places.length ? analysis.places : resolved.unknown).filter(
+            (name) => isPlausiblePlaceLabel(name) && !isThreatLabel(name),
+          );
+          if (!guesses.length && isCityWideKharkivCue(item.text)) {
+            const cityWide = await this.geo.resolveAndLearn(['Харків']);
+            if (cityWide.length) {
+              places.push(...cityWide);
+            }
+          }
+          if (places.length === 0) {
+            this.logger.warn(`msg ${item.dbId} threat without resolved places, skip alert`);
+            if (guesses.length) {
+              void this.telegram.askUnknownToponym({
+                channel: item.channel,
+                text: item.text,
+                guesses,
+              });
+            } else {
+              this.logger.log(`msg ${item.dbId} no plausible place guesses, skip unknown-toponym ask`);
+            }
+            continue;
+          }
         }
 
         const eventKey = canonicalEventKey({

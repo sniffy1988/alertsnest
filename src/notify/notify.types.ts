@@ -9,4 +9,5 @@ export type DeliveryUser = {
 export type AlertMessage = {
   html: string;
   text: string;
+  telegramMarkup?: import('grammy').InlineKeyboard;
 };

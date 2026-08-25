@@ -15,7 +15,7 @@ export class NotifyService {
   async send(user: DeliveryUser, message: AlertMessage): Promise<boolean> {
     const jobs: Array<Promise<boolean>> = [];
     if (user.telegramId != null && this.telegram) {
-      jobs.push(this.telegram.sendHtml(Number(user.telegramId), message.html));
+      jobs.push(this.telegram.sendHtml(Number(user.telegramId), message.html, message.telegramMarkup));
     }
     if (user.whatsappPhone && this.whatsapp?.ready) {
       jobs.push(this.whatsapp.send(user.whatsappPhone, message.text));

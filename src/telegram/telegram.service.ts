@@ -4,12 +4,13 @@ import { Bot, InlineKeyboard, Keyboard, type Context } from 'grammy';
 import { PrismaService } from '../prisma/prisma.service';
 import { GeoService } from '../geo/geo.service';
 import { ToponymService } from '../geo/toponym.service';
+import { CorrectionService } from '../geo/correction.service';
 import { parsePlaceAlias } from '../geo/place-alias';
 import { channelInviteHints } from '../notify/invite-links';
 import { escapeHtml, previewMessage } from '../common/text';
 import { t, type Locale } from '../common/i18n';
 
-type WaitKind = 'channel' | 'area' | 'place';
+type WaitKind = 'channel' | 'area' | 'place' | 'fix';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -18,12 +19,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly adminIds: Set<string>;
   private readonly wait = new Map<number, WaitKind>();
   private readonly placeDraft = new Map<number, string>();
+  private readonly fixMessage = new Map<number, number>();
+  private readonly userWrongReports = new Set<string>();
+  private readonly userFixNotified = new Set<number>();
 
   constructor(
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
     private readonly geo: GeoService,
     private readonly toponyms: ToponymService,
+    private readonly correction: CorrectionService,
   ) {
     this.adminIds = new Set(
       (this.config.get<string>('TELEGRAM_ADMIN_IDS') || '')
@@ -49,6 +54,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       { command: 'addchannel', description: 'Admin: add channel' },
       { command: 'place', description: 'Admin: explain place (geocodes if new)' },
       { command: 'places', description: 'Admin: unexplained toponyms' },
+      { command: 'fix', description: 'Admin: correct last alert place' },
     ]);
     void this.bot.start({
       onStart: () => this.logger.log('Telegram bot started'),
@@ -59,10 +65,17 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     await this.bot?.stop();
   }
 
-  async sendHtml(chatId: number, html: string): Promise<boolean> {
+  async sendHtml(chatId: number, html: string, keyboard?: InlineKeyboard): Promise<boolean> {
     if (!this.bot) return false;
-    await this.bot.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
+    await this.bot.api.sendMessage(chatId, html, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard,
+    });
     return true;
+  }
+
+  alertWrongPlaceKeyboard(locale: string, messageId: number): InlineKeyboard {
+    return new InlineKeyboard().text(t(locale, 'alert_wrong_place'), `wrong:${messageId}`);
   }
 
   private register(): void {
@@ -86,6 +99,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     bot.command('addchannel', (ctx) => this.onAddChannelCmd(ctx));
     bot.command('place', (ctx) => this.onPlaceCmd(ctx));
     bot.command('places', (ctx) => this.onPlacesCmd(ctx));
+    bot.command('fix', (ctx) => this.onFixCmd(ctx));
     bot.command('admin', (ctx) => this.onAdmin(ctx));
 
     bot.hears([t('ua', 'menu_area'), t('ru', 'menu_area'), t('en', 'menu_area')], (ctx) => this.askArea(ctx));
@@ -233,7 +247,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       .row()
       .text(t(user.locale, 'admin_add_place'), 'admin_add_place')
       .row()
-      .text(t(user.locale, 'admin_list_places'), 'admin_list_places');
+      .text(t(user.locale, 'admin_list_places'), 'admin_list_places')
+      .row()
+      .text(t(user.locale, 'admin_fix_raion'), 'admin_fix_raion')
+      .text(t(user.locale, 'admin_fix_place'), 'admin_fix_place');
     await ctx.reply(
       `${t(user.locale, 'admin_title')}\n\n${t(user.locale, 'admin_manage_rules')}\n\n${list}\n\n${t(user.locale, 'admin_direct_cmds')}`,
       { parse_mode: 'Markdown', reply_markup: keyboard },
@@ -275,6 +292,196 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     await this.replyUnknownList(ctx, user.locale);
+  }
+
+  private async onFixCmd(ctx: Context): Promise<void> {
+    const user = await this.requireAdmin(ctx);
+    if (!user) return;
+    const rest = ctx.message?.text?.replace(/^\/fix(@\w+)?\s*/i, '').trim() ?? '';
+    if (!rest) {
+      this.wait.set(ctx.from!.id, 'fix');
+      await ctx.reply(t(user.locale, 'admin_ask_fix'));
+      return;
+    }
+    await this.applyFix(ctx, user.locale, rest, ctx.from!.id);
+  }
+
+  async offerPlaceFix(input: {
+    messageId: number;
+    channel: string;
+    text: string;
+    place: string;
+    users: number;
+    reporter?: string;
+  }): Promise<void> {
+    const admins = await this.prisma.user.findMany({
+      where: { isAdmin: true, isBanned: false, telegramId: { not: null } },
+    });
+    if (!this.bot) return;
+    for (const admin of admins) {
+      if (admin.telegramId == null) continue;
+      const loc = admin.locale;
+      const title = input.reporter
+        ? t(loc, 'admin_user_wrong_title')
+        : t(loc, 'admin_fix_offer_title');
+      const who = input.reporter
+        ? t(loc, 'admin_user_wrong_who', { name: input.reporter, place: input.place })
+        : t(loc, 'admin_fix_offer_place', { place: input.place, n: String(input.users) });
+      const body = [
+        `<b>${escapeHtml(title)}</b>`,
+        escapeHtml(who),
+        input.reporter
+          ? escapeHtml(t(loc, 'admin_fix_offer_place', { place: input.place, n: String(input.users) }))
+          : '',
+        `@${escapeHtml(input.channel)}: ${escapeHtml(previewMessage(input.text, 180))}`,
+        escapeHtml(t(loc, 'admin_ask_fix')),
+      ]
+        .filter(Boolean)
+        .join('\n');
+      const keyboard = new InlineKeyboard()
+        .text(t(loc, 'admin_fix_raion'), `fix_raion:${input.messageId}`)
+        .row()
+        .text(t(loc, 'admin_fix_place'), `fix:${input.messageId}`);
+      try {
+        await this.bot.api.sendMessage(Number(admin.telegramId), body, {
+          parse_mode: 'HTML',
+          reply_markup: keyboard,
+        });
+      } catch (err) {
+        this.logger.warn(`fix-offer admin ${admin.id}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  private async applyFix(ctx: Context, locale: string, name: string, fromId: number): Promise<void> {
+    const messageId = this.fixMessage.get(fromId) ?? null;
+    this.fixMessage.delete(fromId);
+    const result = await this.correction.apply(messageId, name);
+    if (!result.ok && result.reason === 'none') {
+      await ctx.reply(t(locale, 'admin_fix_none'));
+      return;
+    }
+    if (!result.ok && result.reason === 'foreign') {
+      await ctx.reply(t(locale, 'admin_place_foreign', { name }));
+      return;
+    }
+    if (!result.ok && result.reason === 'unknown_target') {
+      this.wait.set(fromId, 'fix');
+      if (messageId != null) this.fixMessage.set(fromId, messageId);
+      await ctx.reply(t(locale, 'admin_place_unknown_target', { name }));
+      return;
+    }
+    if (!result.ok) {
+      await ctx.reply(t(locale, 'admin_ask_fix'));
+      return;
+    }
+    await ctx.reply(
+      t(locale, 'admin_fix_done', {
+        was: result.was,
+        place: result.place,
+        lat: result.lat.toFixed(3),
+        lon: result.lon.toFixed(3),
+      }),
+    );
+    await this.notifyUsersPlaceFixed(result);
+  }
+
+  private async applyRaionFix(ctx: Context, locale: string, messageId: number | null): Promise<void> {
+    const result = await this.correction.applyRaionNotStreet(messageId);
+    if (!result.ok && result.reason === 'none') {
+      await ctx.reply(t(locale, 'admin_fix_none'));
+      return;
+    }
+    if (!result.ok) {
+      this.wait.set(ctx.from!.id, 'fix');
+      if (messageId != null) this.fixMessage.set(ctx.from!.id, messageId);
+      await ctx.reply(t(locale, 'admin_fix_raion_need_name'));
+      return;
+    }
+    await ctx.reply(
+      t(locale, 'admin_fix_done', {
+        was: result.was,
+        place: result.place,
+        lat: result.lat.toFixed(3),
+        lon: result.lon.toFixed(3),
+      }),
+    );
+    await this.notifyUsersPlaceFixed(result);
+  }
+
+  private async notifyUsersPlaceFixed(result: {
+    messageId: number;
+    was: string;
+    place: string;
+  }): Promise<void> {
+    if (this.userFixNotified.has(result.messageId)) return;
+    this.userFixNotified.add(result.messageId);
+    const rows = await this.prisma.alertDelivery.findMany({
+      where: { messageId: result.messageId },
+      include: { user: true },
+    });
+    const seen = new Set<number>();
+    for (const row of rows) {
+      const user = row.user;
+      if (seen.has(user.id) || user.isBanned || user.isAdmin || user.telegramId == null) continue;
+      seen.add(user.id);
+      const html = escapeHtml(
+        t(user.locale, 'admin_fix_user_notice', { was: result.was, place: result.place }),
+      );
+      try {
+        await this.sendHtml(Number(user.telegramId), html);
+      } catch (err) {
+        this.logger.warn(
+          `fix-notice user ${user.id}: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }
+  }
+
+  private async onUserWrongPlace(
+    ctx: Context,
+    user: { id: number; locale: string; username: string | null; firstName: string | null },
+    messageId: number,
+  ): Promise<void> {
+    if (!Number.isInteger(messageId) || messageId <= 0) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    const key = `${user.id}:${messageId}`;
+    if (this.userWrongReports.has(key)) {
+      await ctx.answerCallbackQuery(t(user.locale, 'alert_wrong_place_done'));
+      return;
+    }
+    const message = await this.prisma.message.findUnique({
+      where: { id: messageId },
+      include: { places: true, channel: true },
+    });
+    if (!message) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    this.userWrongReports.add(key);
+    try {
+      await ctx.editMessageReplyMarkup({
+        reply_markup: new InlineKeyboard().text(t(user.locale, 'alert_wrong_place_done'), 'noop'),
+      });
+    } catch {
+      /* message may be too old to edit */
+    }
+    await ctx.answerCallbackQuery(t(user.locale, 'alert_wrong_place_thanks'));
+    await ctx.reply(t(user.locale, 'alert_wrong_place_thanks'));
+
+    const place = message.places[0]?.name ?? '—';
+    const who = user.username ? `@${user.username}` : user.firstName || `id ${user.id}`;
+    const users = await this.prisma.alertDelivery.count({ where: { messageId } });
+    await this.offerPlaceFix({
+      messageId,
+      channel: message.channel.link,
+      text: message.message,
+      place,
+      users,
+      reporter: who,
+    });
   }
 
   private async replyUnknownList(ctx: Context, locale: string): Promise<void> {
@@ -435,6 +642,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery(t(updated.locale, updated.silentMode ? 'on' : 'off'));
       return;
     }
+    if (data === 'noop') {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    if (data.startsWith('wrong:')) {
+      await this.onUserWrongPlace(ctx, user, Number(data.slice(6)));
+      return;
+    }
     if (!user.isAdmin) {
       await ctx.answerCallbackQuery();
       return;
@@ -450,6 +665,15 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
     if (data === 'admin_list_places') {
       await this.replyUnknownList(ctx, user.locale);
+    }
+    if (data.startsWith('fix_raion:') || data === 'admin_fix_raion') {
+      const id = data.startsWith('fix_raion:') ? Number(data.slice(10)) : (this.fixMessage.get(ctx.from.id) ?? NaN);
+      await this.applyRaionFix(ctx, user.locale, Number.isInteger(id) && id > 0 ? id : null);
+    } else if (data === 'admin_fix_place' || data.startsWith('fix:')) {
+      const id = data.startsWith('fix:') ? Number(data.slice(4)) : NaN;
+      if (Number.isInteger(id) && id > 0) this.fixMessage.set(ctx.from.id, id);
+      this.wait.set(ctx.from.id, 'fix');
+      await ctx.reply(t(user.locale, 'admin_ask_fix'));
     }
     if (data.startsWith('teach:')) {
       const id = Number(data.slice(6));
@@ -484,6 +708,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       await this.savePlaceAlias(ctx, user.locale, ctx.message.text);
       return;
     }
+    if (pending === 'fix') {
+      await this.applyFix(ctx, user.locale, ctx.message.text, ctx.from.id);
+      return;
+    }
     await this.addChannel(ctx, user.locale, ctx.message.text);
   }
 
@@ -513,7 +741,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   private async saveArea(ctx: Context, raw: string): Promise<void> {
     const user = await this.upsertUser(ctx);
-    const place = this.geo.findPlace(raw);
+    let place = this.geo.findPlace(raw);
+    if (!place) {
+      const [learned] = await this.toponyms.learn([raw.trim()]);
+      if (learned?.status === 'local') place = learned.place;
+    }
     if (!place) {
       await ctx.reply(t(user.locale, 'area_unknown', { name: raw.trim() }));
       return;

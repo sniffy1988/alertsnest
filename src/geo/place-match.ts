@@ -157,7 +157,55 @@ export function looksLikeSettlement(name: string): boolean {
 }
 
 export function mentionsAdminRaion(text: string): boolean {
-  return /[а-я]{3,}ськ[иі]й\s+район|[а-я]{3,}ск[иі]й\s+район/.test(foldUa(text));
+  return extractRaionPhrase(text) != null;
+}
+
+export function queryLooksLikeStreet(name: string): boolean {
+  return /(вул|улица|просп|майдан|шосе|площадь|площа)\b/.test(foldUa(name));
+}
+
+export function explicitStreetCue(text: string): boolean {
+  return queryLooksLikeStreet(text);
+}
+
+/** Drop city streets that only matched via the same stem as an oblast settlement. */
+export function dropStreetShadows<T extends { name: string; kind?: PlaceKind; matchType?: PlaceKind }>(
+  items: T[],
+  text: string,
+): T[] {
+  const kindOf = (item: T) => item.kind ?? item.matchType;
+  const outerStems = new Set(
+    items
+      .filter((item) => kindOf(item) === 'settlement' || kindOf(item) === 'region')
+      .map((item) => placeStem(item.name))
+      .filter((stem) => stem.length >= 4),
+  );
+  if (!outerStems.size) return items;
+  return items.filter((item) => {
+    if (kindOf(item) !== 'street') return true;
+    const stem = placeStem(item.name);
+    if (!outerStems.has(stem)) return true;
+    return streetFormInText(text, item.name);
+  });
+}
+
+function streetFormInText(text: string, streetName: string): boolean {
+  const folded = foldPlaceText(text);
+  const padded = ` ${folded} `;
+  const phrase = foldUa(streetName);
+  if (phrase.length >= 4 && padded.includes(` ${phrase} `)) return true;
+  const stem = placeStem(streetName);
+  if (stem.length < 4) return false;
+  const tokens = folded.split(' ').filter(Boolean);
+  const adjective = tokens.some(
+    (token) => /(ська|ская|ське|ское|ський|ский|ській|ской)$/.test(token) && placeStem(token) === stem,
+  );
+  return adjective && explicitStreetCue(text);
+}
+
+export function extractRaionPhrase(text: string): string | null {
+  const m = text.match(/[А-Яа-яІіЇїЄєҐґA-Ya-y]{3,}ськ[иі]й\s+район|[А-Яа-яІіЇїЄєҐґA-Ya-y]{3,}ск[иі]й\s+район/i);
+  return m?.[0] ?? null;
 }
 
 export function isVagueOblastName(name: string): boolean {
@@ -166,11 +214,42 @@ export function isVagueOblastName(name: string): boolean {
     /^(харківська|харьковская)?\s*(область|обл)$/.test(n) ||
     n === 'харківська' ||
     n === 'харьковская' ||
+    n === 'харківської' ||
+    n === 'харьковской' ||
     n === 'область' ||
     n === 'пригород' ||
+    n === 'передмістя' ||
+    n === 'передместья' ||
     n === 'околиці' ||
     n === 'околицы'
   );
+}
+
+/** City-wide Kharkiv alert with no specific district/settlement. */
+export function isCityWideKharkivCue(text: string): boolean {
+  const n = foldUa(text);
+  if (!n) return false;
+  const city =
+    /(?:^|\s)(харків|харьков|kharkiv)(?:\s|$|та|и|у|е|і|,)|по\s+харк|по\s+харьк|харків\s+та|харьков\s+и/.test(
+      n,
+    );
+  const wide =
+    /передміст|пригород|повітрян\w*\s+тривог|воздушн\w*\s+тревог|тривога|тревога|по\s+місту|по\s+городу|всьому\s+місту|всему\s+городу/.test(
+      n,
+    );
+  return city && wide;
+}
+
+/** Drop labels that are not worth geocoding / admin explain prompts. */
+export function isPlausiblePlaceLabel(name: string): boolean {
+  const raw = name.trim();
+  if (raw.length < 3 || raw.length > 64) return false;
+  if (isVagueOblastName(raw)) return false;
+  const n = foldUa(raw);
+  if (!n) return false;
+  if (!/[а-яa-z]/i.test(n)) return false;
+  if (/^(так|ні|да|нет|ок|hello|test)$/.test(n)) return false;
+  return true;
 }
 
 /** Cities / oblasts that air channels mention but we do not alert on. */
@@ -242,9 +321,24 @@ export function nominativeGuesses(name: string): string[] {
   const raw = name.trim();
   const folded = foldUa(raw);
   const out = new Set<string>([raw, folded].filter(Boolean));
-  if (folded.length >= 5 && /у$/.test(folded)) out.add(folded.replace(/у$/, 'а'));
-  if (folded.length >= 5 && /ю$/.test(folded)) out.add(folded.replace(/ю$/, 'я'));
-  if (folded.length >= 5 && /ою$/.test(folded)) out.add(folded.replace(/ою$/, 'а'));
+  if (folded.length < 5) return [...out];
+
+  if (/ського$/.test(folded)) out.add(folded.replace(/ського$/, 'ський'));
+  if (/ского$/.test(folded)) out.add(folded.replace(/ского$/, 'ский'));
+  if (/ській$/.test(folded)) out.add(folded.replace(/ській$/, 'ський'));
+  if (/ской$/.test(folded)) out.add(folded.replace(/ской$/, 'ский'));
+  if (/ою$/.test(folded)) out.add(folded.replace(/ою$/, 'а'));
+  if (/ею$/.test(folded)) out.add(folded.replace(/ею$/, 'я'));
+  if (/ом$/.test(folded)) out.add(folded.replace(/ом$/, ''));
+  if (/ем$/.test(folded)) out.add(folded.replace(/ем$/, ''));
+  if (/ах$/.test(folded)) out.add(folded.replace(/ах$/, 'и'));
+  if (/ях$/.test(folded)) out.add(folded.replace(/ях$/, 'і'));
+  if (/у$/.test(folded)) out.add(folded.replace(/у$/, 'а'));
+  if (/ю$/.test(folded)) out.add(folded.replace(/ю$/, 'я'));
+  if (/і$/.test(folded) && !/ські$|цькі$/.test(folded)) out.add(folded.replace(/і$/, 'а'));
+  if (/ї$/.test(folded)) out.add(folded.replace(/ї$/, 'я'));
+  if (/и$/.test(folded) && folded.length >= 6) out.add(folded.replace(/и$/, 'а'));
+
   return [...out];
 }
 
