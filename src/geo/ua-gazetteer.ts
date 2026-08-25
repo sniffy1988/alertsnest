@@ -107,7 +107,7 @@ export const GAZETTEER: GazetteerPlace[] = [
   {
     code: 'cherkaski_tyshky',
     name: 'Черкаські Тишки',
-    aliases: ['черкаські тишки', 'черкасские тишки', 'черкаськітишки'],
+    aliases: ['черкаські тишки', 'черкасские тишки', 'черкаськітишки', 'тишки', 'тышки'],
     lat: 50.122,
     lon: 36.401,
     kind: 'settlement',

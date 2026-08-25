@@ -14,6 +14,8 @@ export const PLACE_SLANG: Record<string, string> = {
   казачка: foldUa('козача лопань'),
   'казачья лопань': foldUa('козача лопань'),
   'кащачья лопань': foldUa('козача лопань'),
+  тишки: foldUa('черкаські тишки'),
+  тышки: foldUa('черкаські тишки'),
 };
 
 export function foldPlaceText(s: string): string {
