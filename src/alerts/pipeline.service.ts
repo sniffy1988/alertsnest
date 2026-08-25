@@ -39,10 +39,12 @@ export class PipelineService {
   private readonly logger = new Logger(PipelineService.name);
   private buffer: BufferedMessage[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
+  private scheduledWaitMs: number | null = null;
   private flushing = false;
   private readonly inFlight = new Set<number>();
   private readonly batchSize: number;
   private readonly waitMs: number;
+  private readonly alertWaitMs: number;
 
   constructor(
     config: ConfigService,
@@ -54,7 +56,8 @@ export class PipelineService {
     private readonly metrics: MetricsService,
   ) {
     this.batchSize = Math.max(1, Number(config.get('LLM_BATCH_SIZE') ?? 6));
-    this.waitMs = Math.max(500, Number(config.get('LLM_BATCH_WAIT_MS') ?? 2000));
+    this.waitMs = Math.max(0, Number(config.get('LLM_BATCH_WAIT_MS') ?? 2000));
+    this.alertWaitMs = Math.max(0, Number(config.get('LLM_ALERT_WAIT_MS') ?? 150));
   }
 
   enqueue(items: BufferedMessage[]): number {
@@ -72,13 +75,32 @@ export class PipelineService {
       void this.flush();
       return fresh.length;
     }
-    if (!this.flushTimer) {
-      this.flushTimer = setTimeout(() => {
-        this.flushTimer = null;
-        void this.flush();
-      }, this.waitMs);
-    }
+    this.scheduleFlush();
     return fresh.length;
+  }
+
+  /** Live alerts use a short coalesce window; backlog/learn uses waitMs. */
+  private bufferWaitMs(): number {
+    return this.buffer.some((item) => item.alert) ? this.alertWaitMs : this.waitMs;
+  }
+
+  private scheduleFlush(): void {
+    const ms = this.bufferWaitMs();
+    // Keep existing timer unless we need a shorter alert coalesce window.
+    if (this.flushTimer != null && this.scheduledWaitMs != null && ms >= this.scheduledWaitMs) {
+      return;
+    }
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+      this.scheduledWaitMs = null;
+    }
+    this.scheduledWaitMs = ms;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.scheduledWaitMs = null;
+      void this.flush();
+    }, ms);
   }
 
   private async flush(): Promise<void> {
@@ -86,6 +108,7 @@ export class PipelineService {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
+      this.scheduledWaitMs = null;
     }
     if (this.buffer.length === 0) return;
 
@@ -291,10 +314,7 @@ export class PipelineService {
       this.flushing = false;
       if (this.buffer.length >= this.batchSize) void this.flush();
       else if (this.buffer.length > 0 && !this.flushTimer) {
-        this.flushTimer = setTimeout(() => {
-          this.flushTimer = null;
-          void this.flush();
-        }, this.waitMs);
+        this.scheduleFlush();
       }
     }
   }

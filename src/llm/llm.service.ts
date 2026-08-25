@@ -91,70 +91,35 @@ const RESPONSE_SCHEMA = {
   required: ['items'],
 };
 
-const SYSTEM_PROMPT = `Ти аналітик повітряних загроз Харкова і Харківської області. Канали пишуть сленгом.
-Відповідь СТРОГО один JSON-об'єкт (без markdown, без **жирного**, без тексту навколо):
-{"items":[{"id":"<id з входу>","is_threat":true|false,"events":[{"weapon":"...","weapon_raw":"...","name":"...","kind":"..."}],"summary_uk":"..."}]}
-Для КОЖНОГО поста з входу — окремий елемент items з тим самим id.
-events — масив пар «зброя + місце». Одна зброя + одне місце = один елемент. Два населені пункти → два елементи (навіть з одним weapon).
-Новини / реклама / донати → is_threat=false, events=[].
+const SYSTEM_PROMPT = `Ти аналітик повітряних загроз Харкова і області. Сленг каналів.
+Тільки JSON (без markdown): {"items":[{"id":"<id>","is_threat":true|false,"events":[{"weapon":"...","weapon_raw":"...","name":"...","kind":"..."}],"summary_uk":"..."}]}
+Кожен вхідний пост → окремий item з тим самим id. events = пари зброя+місце (1 місце = 1 елемент; 2 села → 2 елементи). Новини/реклама/донати → is_threat=false, events=[].
 
-weapon (enum):
-- shahed: шахед, шаболда, мопед, герань, geran, бандероль
-- ballistic: балістика, іскандер, орешник / орешника
-- cruise: крилата, калибр, іскандер-к, онікс
-- kinzhal: кинжал / кинджал
-- kh59: х-59, -59
-- kab: каб, фаб, умпк, БНР (авіація над Бєлгородщиною → можливі пуски КАБ)
-- mlrs: рсзо, град, смерч, вільха
-- jet_uav: реактивний БПЛА, швидкісна, Р. Шахед, Р. Шаболда
-- strike_uav: ударний БПЛА
-- missile: ракета (якщо тип неясний)
-- recon: дорозвідка, розвідник
-- aircraft: 31к, міг-31, ту-95, стратегічна (без БНР — БНР це kab)
-- explosion: приліт, вибух, упав
-- air_raid: повітря / воздух / тривога без типу зброї
-- sam: наша бойова, ппо
-- all_clear: ТІЛЬКИ явні «відбій», «отбой», «укриття знято», «все чисто»
-- none: не використовуй у events (новини → events=[])
-- other: лише якщо тип зовсім неясний
+weapon: shahed(шахед/шаболда/мопед/герань/бандероль) | ballistic(балістика/іскандер/орешник) | cruise(крилата/калибр/іскандер-к/онікс) | kinzhal | kh59(-59) | kab(каб/фаб/умпк/БНР) | mlrs(рсзо/град/смерч/вільха) | jet_uav(реактивний БПЛА/швидкісна/Р. Шахед/Р. Шаболда) | strike_uav | missile(ракета неясна) | recon(дорозвідка) | aircraft(31к/міг-31/ту-95; БНР=kab) | explosion(приліт/вибух) | air_raid(повітря/тривога без типу) | sam(ппо) | all_clear(ТІЛЬКИ «відбій»/«отбой»/«укриття знято»/«все чисто») | other(неясний). none не в events.
+weapon_raw: як у тексті, не перекладати. all_clear → «відбій»/«отбой».
 
-weapon_raw: фрагмент з тексту як є («Орешник», «Шаболда», «Р. Шахед», «мопед», «балістика»). Не перекладати. all_clear → «відбій»/«отбой» з тексту.
+name/kind: ОДИН топонім з ПОТОЧНОГО тексту («не наблюдается» → з останнього context). Не писати зброю в name.
+ЗАБОРОНЕНО «Харків та передмістя»/«місто і пригород» → name="Харків", kind=city.
+kind: street | district(Салтівка) | city(Харків/по місту) | settlement(село/передмістя) | region(адмінрайон/північ області). Немає топоніма по місту → Харків/city. Не вирішуй наше/чуже. name можна приблизно — важливіший weapon.
+Аліаси: СС=Північна Салтівка, БД=Велика Данилівка, Козачка/Казачья Лопань=Козача Лопань(settlement), «Ст Салтов»=Старий Салтів(НЕ Салтівка). Краснопавлівка≠Павлівка.
 
-name / kind: ОДИН топонім з ПОТОЧНОГО тексту (для «не наблюдается» — з останнього пункту context). Не писати зброю в name.
-ЗАБОРОНЕНО в name: «Харків та передмістя», «місто і пригород» — пиши лише «Харків», kind=city.
-kind:
-- street — вулиця міста
-- district — район МІСТА (Салтівка, Олексіївка)
-- city — Харків / «по всьому місту» / «Харків та передмістя»
-- settlement — смт, село, конкретне передмістя (Пісочин, Дергачі)
-- region — адмінрайон області («Чугуївський район») / «північ області»
-Немає топоніма, але загроза по місту → name="Харків", kind=city.
-Не вирішуй «наше/чуже» — координати рахуємо ми. Топонім як у тексті (без «та передмістя»).
-name можна опустити або написати приблизно — бекенд сам читає місця з тексту словником; важливіший weapon.
-СС = Північна Салтівка, БД = Велика Данилівка. Козачка / Казачья Лопань / Кащачья Лопань = Козача Лопань (settlement). «Ст Салтов» = Старий Салтів (settlement), НЕ Салтівка.
-Краснопавлівка ≠ Павлівка. Сахновщина, Лозова, Зачепилівка — settlement області.
-context — попередні пости гілки. Тип зброї (weapon / weapon_raw) з початку ланцюжка; name — куди далі з ПОТОЧНОГО тексту.
-«Далі / Далее / Дальше / курс на X» при context з КАБ/шахедом — це ПРОДОВЖЕННЯ загрози: is_threat=true, events з місцями з поточного тексту, weapon з context. НЕ events=[].
-НЕ став is_threat=false через «Підпишись» у футері — ігноруй підписку.
+context = попередні пости гілки: weapon з початку ланцюжка, name з поточного тексту.
+«Далі/Далее/Дальше/курс на X» + context з КАБ/шахедом = продовження: is_threat=true, events з місць поточного, weapon з context (НЕ []).
+«Не фиксируется»/«Більше не фіксується» + context → is_threat=true, events з місць context.
+«без повторних пусків» → is_threat=false, events=[]. Відбій по району → all_clear + name району (НЕ весь Харків). Ігноруй «Підпишись»/донати/підлітний час без нового місця.
+
 Приклади:
-«Р. Шаболда на Сахновщину» → events=[{weapon:jet_uav, weapon_raw:"Р. Шаболда", name:"Сахновщина", kind:settlement}]
-«Угроза Орешника» → events=[{weapon:ballistic, weapon_raw:"Орешника", name:"Харків", kind:city}]
-«Загроза балістики‼️» → events=[{weapon:ballistic, weapon_raw:"балістики", name:"Харків", kind:city}]
-«Харків та передмістя - повітряна тривога!» → events=[{weapon:air_raid, weapon_raw:"повітряна тривога", name:"Харків", kind:city}]
-«Чугуївський район - повітряна тривога!» → events=[{weapon:air_raid, weapon_raw:"повітряна тривога", name:"Чугуївський район", kind:region}]
-«БНР» / «БНР!» → events=[{weapon:kab, weapon_raw:"БНР", name:"Харків", kind:city}]
-«На Салтівку» у реплаї до шахеда → events=[{weapon:shahed, weapon_raw з context, name:"Салтівка", kind:district}]
-«Шаболда на Салтівку і Олексіївку» → два елементи з одним weapon=shahed
-«КАБ перетинає кордон в напрямку Козача Лопань/Цупівка/Прудянка» → три елементи kab на кожне село
-«Далее на Прудянку» context=[…КАБ…] → events=[{weapon:kab, weapon_raw:"КАБ", name:"Прудянка", kind:settlement}]
-«Дальше курс на Прудянку/Слатино» context=[…КАБ…] → два settlement: Прудянка і Слатино
-«На даний час без повторних пусків КАБ» → is_threat=false, events=[] (не нова загроза)
-«Берестинський район - тривога знято» → is_threat=false, weapon=all_clear, name="Берестинський район", kind=region
-«Богодухівський район - відбій» → weapon=all_clear, name="Богодухівський район", kind=region (НЕ весь Харків)
-«Далі на Полтаву» → name="Полтава", не підміняй на Харків
-«Не фиксируется» / «Більше не фіксується» при context з місцями → is_threat=true, track через events з місць context, weapon з context
-Ігноруй «Підпишись», донати, підлітний час без нового місця.
-Ще раз: тільки JSON {"items":[...]}, без markdown.`;
+«Р. Шаболда на Сахновщину» → jet_uav/Сахновщина/settlement
+«Угроза Орешника» / «Загроза балістики» → ballistic/Харків/city
+«Харків та передмістя - повітряна тривога» → air_raid/Харків/city
+«Чугуївський район - тривога» → air_raid/Чугуївський район/region
+«БНР!» → kab/Харків/city
+«На Салтівку» reply до шахеда → shahed/Салтівка/district
+«Шаболда на Салтівку і Олексіївку» → 2×shahed
+«КАБ … Козача Лопань/Цупівка/Прудянка» → 3×kab
+«Далее на Прудянку» / «Дальше курс на Прудянку/Слатино» + context КАБ → kab на ці села
+«Богодухівський район - відбій» → all_clear/Богодухівський район/region
+«Далі на Полтаву» → name=Полтава (не Харків)`;
 
 @Injectable()
 export class LlmService {
@@ -250,7 +215,7 @@ export class LlmService {
       options: {
         temperature: 0,
         num_ctx: 2048,
-        num_predict: 1024,
+        num_predict: 512,
       },
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
@@ -393,6 +358,7 @@ function stripThinking(content: string): string {
  * **is_threat:** true
  * **events:** [ {...}, ... ]
  * **summary_uk:** ...
+ * or nearly-valid JSON missing trailing `]}`.
  */
 function coerceLlmJson(
   content: string,
@@ -405,7 +371,14 @@ function coerceLlmJson(
     markdownFieldsToJson(trimmed),
   ].filter(Boolean) as string[];
 
+  const expanded: string[] = [];
   for (const candidate of candidates) {
+    expanded.push(candidate);
+    const repaired = repairTruncatedJson(candidate);
+    if (repaired && repaired !== candidate) expanded.push(repaired);
+  }
+
+  for (const candidate of expanded) {
     try {
       const parsed = JSON.parse(candidate) as Record<string, unknown>;
       if (Array.isArray(parsed.items)) {
@@ -434,9 +407,48 @@ function extractJsonCandidates(text: string): string[] {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence?.[1]) out.push(fence[1].trim());
   const start = text.indexOf('{');
+  if (start < 0) return out;
   const end = text.lastIndexOf('}');
-  if (start >= 0 && end > start) out.push(text.slice(start, end + 1));
+  if (end > start) out.push(text.slice(start, end + 1));
+  // Truncated payloads often end mid-structure — take to EOF for repair.
+  const toEnd = text.slice(start).trim();
+  if (toEnd && toEnd !== out[out.length - 1]) out.push(toEnd);
   return out;
+}
+
+/** Close unclosed { [ " so tiny models' truncated JSON can parse. */
+function repairTruncatedJson(raw: string): string {
+  let s = raw.trim().replace(/,\s*([}\]])/g, '$1');
+  const stack: string[] = [];
+  let inString = false;
+  let escape = false;
+  for (const ch of s) {
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if ((ch === '}' || ch === ']') && stack.length && stack[stack.length - 1] === ch) {
+      stack.pop();
+    }
+  }
+  if (inString) s += '"';
+  s = s.replace(/,\s*$/, '');
+  while (stack.length) s += stack.pop();
+  return s;
 }
 
 /** Convert **key:** value markdown blobs into a JSON object string. */
