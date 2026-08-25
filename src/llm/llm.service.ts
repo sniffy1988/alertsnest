@@ -95,10 +95,10 @@ const SYSTEM_PROMPT = `Ти аналітик повітряних загроз �
 Тільки JSON (без markdown): {"items":[{"id":"<id>","is_threat":true|false,"events":[{"weapon":"...","weapon_raw":"...","name":"...","kind":"..."}],"summary_uk":"..."}]}
 Кожен вхідний пост → окремий item з тим самим id. events = пари зброя+місце (1 місце = 1 елемент; 2 села → 2 елементи). Новини/реклама/донати → is_threat=false, events=[].
 
-weapon: shahed(шахед/шаболда/мопед/герань/бандероль) | ballistic(балістика/іскандер/орешник) | cruise(крилата/калибр/іскандер-к/онікс) | kinzhal | kh59(-59) | kab(каб/фаб/умпк/БНР) | mlrs(рсзо/град/смерч/вільха) | jet_uav(реактивний БПЛА/швидкісна/Р. Шахед/Р. Шаболда) | strike_uav | missile(ракета неясна) | recon(дорозвідка) | aircraft(31к/міг-31/ту-95; БНР=kab) | explosion(приліт/вибух) | air_raid(повітря/тривога без типу) | sam(ппо) | all_clear(ТІЛЬКИ «відбій»/«отбой»/«укриття знято»/«все чисто») | other(неясний). none не в events.
-weapon_raw: як у тексті, не перекладати. all_clear → «відбій»/«отбой».
+weapon: shahed(шахед/шаболда/мопед/герань/бандероль/молнія/молния) | ballistic(балістика/іскандер/орешник) | cruise(крилата/калибр/іскандер-к/онікс) | kinzhal | kh59(-59) | kab(каб/фаб/умпк/БНР) | mlrs(рсзо/град/смерч/вільха) | jet_uav(реактивний БПЛА/швидкісна/Р. Шахед/Р. Шаболда) | strike_uav | missile(ракета неясна) | recon(дорозвідка) | aircraft(31к/міг-31/ту-95; БНР=kab) | explosion(приліт/вибух) | air_raid(повітря/тривога без типу) | sam(ппо) | all_clear(ТІЛЬКИ «відбій»/«отбой»/«укриття знято»/«все чисто») | other(неясний). none не в events.
+weapon_raw: фрагмент зброї з тексту («Молнія», «мопед»). НЕ клади топонім у weapon_raw. all_clear → «відбій»/«отбой».
 
-name/kind: ОДИН топонім з ПОТОЧНОГО тексту («не наблюдается» → з останнього context). Не писати зброю в name.
+name/kind: ОБОВ'ЯЗКОВО топонім з ПОТОЧНОГО тексту («не наблюдается» → з останнього context). Не писати зброю в name.
 ЗАБОРОНЕНО «Харків та передмістя»/«місто і пригород» → name="Харків", kind=city.
 kind: street | district(Салтівка) | city(Харків/по місту) | settlement(село/передмістя) | region(адмінрайон/північ області). Немає топоніма по місту → Харків/city. Не вирішуй наше/чуже. name можна приблизно — важливіший weapon.
 Аліаси: СС=Північна Салтівка, БД=Велика Данилівка, Козачка/Казачья Лопань=Козача Лопань(settlement), «Ст Салтов»=Старий Салтів(НЕ Салтівка). Краснопавлівка≠Павлівка.
@@ -110,6 +110,7 @@ context = попередні пости гілки: weapon з початку л�
 
 Приклади:
 «Р. Шаболда на Сахновщину» → jet_uav/Сахновщина/settlement
+«Молнія на Руську Лозову» / «Молния курсом на Русскую Лозовую» → shahed(weapon_raw=Молнія)/Руська Лозова/settlement
 «Угроза Орешника» / «Загроза балістики» → ballistic/Харків/city
 «Харків та передмістя - повітряна тривога» → air_raid/Харків/city
 «Чугуївський район - тривога» → air_raid/Чугуївський район/region
@@ -135,7 +136,7 @@ export class LlmService {
     private readonly metrics: MetricsService,
   ) {
     this.client = new Ollama({ host: config.get<string>('OLLAMA_HOST') || 'http://127.0.0.1:11434' });
-    this.model = config.get<string>('OLLAMA_MODEL') || 'qwen3.5:2b-mlx';
+    this.model = config.get<string>('OLLAMA_MODEL') || 'qwen3.5:0.8b-mlx';
     const keep = config.get<string>('OLLAMA_KEEP_ALIVE') ?? '-1';
     this.keepAlive = keep === '-1' ? -1 : keep;
   }
@@ -300,12 +301,6 @@ export class LlmService {
     for (const item of raw) {
       if (!item || typeof item !== 'object') continue;
       const row = item as Record<string, unknown>;
-      const rawName = typeof row.name === 'string' ? row.name.trim() : '';
-      if (rawName.length < 2 || rawName.length > 64 || !/[а-яa-z]/i.test(rawName)) continue;
-      const kindRaw = typeof row.kind === 'string' ? row.kind : 'settlement';
-      const kindIn: PlaceKind = PLACE_KINDS.has(kindRaw as PlaceKind)
-        ? (kindRaw as PlaceKind)
-        : 'settlement';
       const weapon =
         typeof row.weapon === 'string' && (WEAPON_ENUM as readonly string[]).includes(row.weapon)
           ? (row.weapon as LlmWeapon)
@@ -314,13 +309,29 @@ export class LlmService {
         typeof row.weapon_raw === 'string'
           ? row.weapon_raw.trim().slice(0, 64) || null
           : null;
+      let rawName = typeof row.name === 'string' ? row.name.trim() : '';
+      // Tiny models sometimes put the toponym in weapon_raw and omit name.
+      if (
+        (!rawName || rawName.length < 2) &&
+        weaponLabel &&
+        !isThreatLabel(weaponLabel) &&
+        /[а-яa-z]/i.test(weaponLabel)
+      ) {
+        rawName = weaponLabel;
+      }
+      if (rawName.length < 2 || rawName.length > 64 || !/[а-яa-z]/i.test(rawName)) continue;
+      if (isThreatLabel(rawName)) continue;
+      const kindRaw = typeof row.kind === 'string' ? row.kind : 'settlement';
+      const kindIn: PlaceKind = PLACE_KINDS.has(kindRaw as PlaceKind)
+        ? (kindRaw as PlaceKind)
+        : 'settlement';
       for (const part of splitCompoundPlaceNames(rawName)) {
         if (isVagueOblastName(part) || isThreatLabel(part)) continue;
         const { name, kind } = normalizeLlmPlace(part, kindIn);
         if (isVagueOblastName(name) || isThreatLabel(name)) continue;
         out.push({
           weapon,
-          weaponRaw: weaponLabel,
+          weaponRaw: weaponLabel && isThreatLabel(weaponLabel) ? weaponLabel : null,
           name,
           kind,
         });
@@ -354,7 +365,7 @@ function stripThinking(content: string): string {
 }
 
 /**
- * Tiny models (qwen3.5:2b-mlx) often ignore JSON schema and return markdown like:
+ * Tiny models (qwen3.5:0.8b-mlx) often ignore JSON schema and return markdown like:
  * **is_threat:** true
  * **events:** [ {...}, ... ]
  * **summary_uk:** ...

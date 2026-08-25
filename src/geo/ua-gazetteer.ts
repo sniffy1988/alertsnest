@@ -53,7 +53,7 @@ export const GAZETTEER: GazetteerPlace[] = [
   { code: 'pyatykhatky', name: "П'ятихатки", aliases: ['пятихатки', "п'ятихатки"], lat: 50.078, lon: 36.217, kind: 'district' },
   { code: 'kholodna_hora', name: 'Холодна Гора', aliases: ['холодна гора', 'холодная гора', 'холодногірський'], lat: 49.984, lon: 36.178, kind: 'district' },
   { code: 'nova_bavaria', name: 'Нова Баварія', aliases: ['нова баварія', 'новобаварський', 'новая бавария', 'залютине'], lat: 49.96, lon: 36.175, kind: 'district' },
-  { code: 'osnova', name: 'Основа', aliases: ['основа', 'основянський'], lat: 49.958, lon: 36.235, kind: 'district' },
+  { code: 'osnova', name: 'Основа', aliases: ['основа', 'основянський', 'основянский', 'основянський район', 'основянский район', 'основянському району', 'основянскому району'], lat: 49.958, lon: 36.235, kind: 'district' },
   { code: 'nemyshlia', name: 'Немишля', aliases: ['немишля', 'немишлянський', 'нові будинки', 'новые дома'], lat: 49.98, lon: 36.3, kind: 'district' },
   { code: 'htz', name: 'ХТЗ', aliases: ['хтз', 'індустріальний', 'индустриальный'], lat: 49.952, lon: 36.318, kind: 'district' },
   { code: 'rogan', name: 'Рогань', aliases: ['рогань'], lat: 49.94, lon: 36.36, kind: 'district' },

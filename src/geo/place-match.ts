@@ -56,11 +56,11 @@ export function placeStem(s: string): string {
   let n = foldUa(s)
     .replace(new RegExp(`${WORD}(ст|стар|старий|старый|смт|село|селище|місто|м|вул|улица|просп|пр|проспект|майдан|площадь|площа)${END}`, 'g'), '$1')
     .replace(new RegExp(`${WORD}(харківська|харьковская)\\s+(область|обл)${END}`, 'g'), '$1')
-    .replace(new RegExp(`${WORD}(область|обл|район|пригород|околиці|околицы|передмістя)${END}`, 'g'), '$1')
+    .replace(new RegExp(`${WORD}(область|обл|район(?:у|е|ом|а|і)?|пригород|околиці|околицы|передмістя)${END}`, 'g'), '$1')
     .replace(/\s+/g, ' ')
     .trim();
   if (n.length < 6) return n;
-  n = n.replace(/(ського|ского|ській|ской|ська|ская|ське|ское|ський|ский)$/g, '');
+  n = n.replace(/(ського|ского|ському|скому|ській|ской|ська|ская|ське|ское|ський|ский)$/g, '');
   const adj = n.replace(/(ового|овому|ової|овой)$/g, '');
   if (adj.length >= 5) n = adj;
   if (n.length >= 6) n = n.replace(/[аеиоуиюя]$/g, '');
@@ -112,11 +112,11 @@ export function tokenRefersToName(token: string, name: string): boolean {
   for (const variant of placeVariants(name)) {
     if (formMatches(token, variant)) return true;
   }
-  if (/\s+район$/.test(fl)) {
-    const head = fl.replace(/\s+район$/, '');
+  if (/\s+район(?:у|е|ом|а|і)?$/.test(fl)) {
+    const head = fl.replace(/\s+район(?:у|е|ом|а|і)?$/, '');
     if (ft === head || formMatches(token, head)) return true;
     if (
-      /(ський|ский|ська|ская|ське|ское|ській|ской)$/.test(ft) &&
+      /(ський|ский|ська|ская|ське|ское|ській|ской|ському|скому)$/.test(ft) &&
       placeStem(ft) === placeStem(head)
     ) {
       return true;

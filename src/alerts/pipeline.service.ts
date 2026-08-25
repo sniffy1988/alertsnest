@@ -345,18 +345,15 @@ export class PipelineService {
       ];
     }
     // Trajectory update / empty LLM places — recover toponyms from gazetteer scan.
-    if (
-      analysis.notify &&
-      analysis.threatType &&
-      analysis.threatType !== 'none' &&
-      analysis.threatType !== 'other'
-    ) {
+    // Tiny models often return type=other with empty events; still alert if scan found places.
+    if (analysis.notify && analysis.isThreat && analysis.threatType && analysis.threatType !== 'none') {
+      const weapon = (analysis.threatType === 'other' ? 'other' : analysis.threatType) as LlmEvent['weapon'];
       if (scanned.length) {
         this.logger.log(
           `events fallback from text: type=${analysis.threatType} places=[${scanned.map((h) => h.name).join(', ')}]`,
         );
         return scanned.map((h) => ({
-          weapon: analysis.threatType as LlmEvent['weapon'],
+          weapon,
           weaponRaw: null,
           name: h.name,
           kind: h.matchType,
@@ -366,7 +363,7 @@ export class PipelineService {
       const hits = this.geo.findPlacesInText(placeText);
       if (hits.length) {
         return hits.map((h) => ({
-          weapon: analysis.threatType as LlmEvent['weapon'],
+          weapon,
           weaponRaw: null,
           name: h.name,
           kind: h.matchType,

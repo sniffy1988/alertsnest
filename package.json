@@ -2,7 +2,7 @@
   "name": "alertsnest",
   "version": "1.0.0",
   "private": true,
-  "description": "Geo-aware Telegram threat alerts via local qwen3.5:2b-mlx",
+  "description": "Geo-aware Telegram threat alerts via local qwen3.5:0.8b-mlx",
   "license": "ISC",
   "scripts": {
     "build": "nest build",

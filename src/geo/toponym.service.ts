@@ -24,6 +24,7 @@ import {
   nominativeGuesses,
   OBLAST_BBOX,
   placeForms,
+  formMatches,
   placeStem,
   placeVariants,
   preferRaionOverStemSiblings,
@@ -233,6 +234,24 @@ export class ToponymService implements OnModuleInit {
         if (phraseHit) {
           scored.push({ item, len: phrase.length });
           break;
+        }
+        // Declined multi-word: «Руську Лозову» ↔ «Руська Лозова» (forms decline only last word).
+        if (phrase.includes(' ')) {
+          const formHit = placeForms(label).some(
+            (form) => form.includes(' ') && haystacks.some((hay) => ` ${hay} `.includes(` ${form} `)),
+          );
+          if (formHit) {
+            scored.push({ item, len: phrase.length });
+            break;
+          }
+          const parts = phrase.split(' ').filter((p) => p.length >= 3);
+          if (
+            parts.length >= 2 &&
+            parts.every((part) => tokens.some((token) => formMatches(token, part)))
+          ) {
+            scored.push({ item, len: phrase.length });
+            break;
+          }
         }
         if (phrase.length >= 2 && phrase.length <= 3 && tokens.includes(phrase)) {
           scored.push({ item, len: phrase.length });
