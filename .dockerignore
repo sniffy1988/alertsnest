@@ -1,0 +1,14 @@
+node_modules
+dist
+data
+.git
+.github
+.env
+.env.*
+!.env.example
+*.db
+*.db-journal
+.DS_Store
+*.md
+.cursor
+agent-transcripts

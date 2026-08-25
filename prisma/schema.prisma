@@ -1,0 +1,132 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Channel {
+  id             Int       @id @default(autoincrement())
+  name           String?
+  link           String    @unique
+  scrapTimeout   Int       @default(3000)
+  addedAt        DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lastScrapedAt  DateTime?
+  lastTelegramId BigInt    @default(0)
+  messages       Message[]
+  subscribers    User[]    @relation("UserSubscriptions")
+}
+
+model Message {
+  id                Int               @id @default(autoincrement())
+  telegramId        BigInt
+  message           String
+  mediaUrl          String?
+  mediaType         String?
+  date              DateTime
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  channelId         Int
+  replyToTelegramId BigInt?
+  channel           Channel           @relation(fields: [channelId], references: [id])
+  analysis          MessageAnalysis?
+  places            ThreatPlace[]
+  deliveries        AlertDelivery[]
+
+  @@unique([telegramId, channelId])
+  @@index([channelId, replyToTelegramId])
+}
+
+model MessageAnalysis {
+  id         Int      @id @default(autoincrement())
+  messageId  Int      @unique
+  message    Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  isThreat   Boolean
+  severity   String?
+  threatType String?
+  summary    String?
+  eventKey   String?
+  rawJson    String
+  model      String
+  createdAt  DateTime @default(now())
+}
+
+model ThreatPlace {
+  id         Int     @id @default(autoincrement())
+  messageId  Int
+  message    Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  name       String
+  lat        Float?
+  lon        Float?
+  oblastCode String?
+  matchType  String
+}
+
+model User {
+  id                Int       @id @default(autoincrement())
+  telegramId        BigInt?   @unique
+  whatsappPhone     String?   @unique
+  viberId           String?   @unique
+  username          String?
+  firstName         String?
+  lastName          String?
+  registeredAt      DateTime  @default(now())
+  silentMode        Boolean   @default(false)
+  isAdmin           Boolean   @default(false)
+  locale            String    @default("ua")
+  isBanned          Boolean   @default(false)
+  lat               Float?
+  lon               Float?
+  radiusKm          Int       @default(40)
+  oblastCode        String?
+  locationUpdatedAt DateTime?
+  subscribedTo      Channel[] @relation("UserSubscriptions")
+  deliveries        AlertDelivery[]
+}
+
+model FilterPhrase {
+  id      Int     @id @default(autoincrement())
+  phrase  String  @unique
+  exclude Boolean @default(false)
+}
+
+model Toponym {
+  id        Int      @id @default(autoincrement())
+  name      String
+  norm      String   @unique
+  aliases   String   @default("[]")
+  lat       Float
+  lon       Float
+  kind      String
+  source    String
+  hitCount  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UnknownToponym {
+  id         Int      @id @default(autoincrement())
+  label      String
+  norm       String   @unique
+  sampleText String?
+  channel    String?
+  hitCount   Int      @default(1)
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+}
+
+model AlertDelivery {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  messageId Int
+  eventKey  String?
+  sentAt    DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, messageId])
+  @@index([userId, eventKey])
+}

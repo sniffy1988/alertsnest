@@ -1,0 +1,192 @@
+import { Injectable } from '@nestjs/common';
+import { KHARKIV_CENTER, type PlaceKind } from './ua-gazetteer';
+import { ToponymService, type MemoryToponym } from './toponym.service';
+import { detectOblastRegion, isVagueOblastName, mentionedIn } from './place-match';
+
+export type ResolvedPlace = {
+  name: string;
+  lat: number;
+  lon: number;
+  code: string;
+  matchType: PlaceKind;
+};
+
+const CITY_RADIUS_KM = 22;
+const NEARBY_KM: Record<PlaceKind, number> = {
+  street: 4,
+  district: 4,
+  city: 22,
+  settlement: 8,
+  region: 12,
+};
+
+@Injectable()
+export class GeoService {
+  constructor(private readonly toponyms: ToponymService) {}
+
+  haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const toRad = (n: number) => (n * Math.PI) / 180;
+    const r = 6371;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 2 * r * Math.asin(Math.sqrt(a));
+  }
+
+  isInKharkiv(lat: number, lon: number): boolean {
+    return this.haversineKm(lat, lon, KHARKIV_CENTER.lat, KHARKIV_CENTER.lon) <= CITY_RADIUS_KM;
+  }
+
+  resolveUserArea(lat: number, lon: number): { oblastCode: string; label: string } {
+    if (!this.isInKharkiv(lat, lon)) {
+      return { oblastCode: 'outside', label: 'поза Харковом' };
+    }
+    const street = this.nearestOfKind(lat, lon, 'street');
+    const district = this.nearestOfKind(lat, lon, 'district');
+    return {
+      oblastCode: district?.norm ?? street?.norm ?? 'kharkiv',
+      label: [street?.name, district?.name].filter(Boolean).join(', ') || 'Харків',
+    };
+  }
+
+  async resolveThreatPlaces(input: {
+    text: string;
+    llmPlaces: string[];
+    oblast?: string | null;
+    geoScope?: string | null;
+  }): Promise<ResolvedPlace[]> {
+    const region = detectOblastRegion(input.text);
+    const fromText = this.toponyms.findInText(input.text);
+    const groundedLlm = input.llmPlaces.filter(
+      (name) => !isVagueOblastName(name) && mentionedIn(input.text, name),
+    );
+    const lookedUp = input.llmPlaces
+      .filter((name) => !isVagueOblastName(name))
+      .map((name) => this.toponyms.lookup(name))
+      .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name));
+
+    const names: string[] = [];
+    if (fromText.length) names.push(...fromText.map((p) => p.name));
+    else names.push(...groundedLlm);
+    names.push(...lookedUp.map((p) => p.name));
+    if (region) names.unshift(region.name);
+    if (input.oblast && !isVagueOblastName(input.oblast) && mentionedIn(input.text, input.oblast)) {
+      names.push(input.oblast);
+    }
+
+    const uniqueNames = [...new Set(names.map((n) => n.trim()).filter((n) => n.length >= 3))];
+    if (uniqueNames.length === 0) return [];
+
+    const cityHint = this.toponyms.lookup('Харків');
+    const learned = await this.toponyms.learn(uniqueNames, cityHint);
+    const unique = new Map<number, ResolvedPlace>();
+    for (const item of learned) {
+      unique.set(item.id, this.toResolved(item));
+    }
+    if (region && ![...unique.values()].some((p) => p.code === region.code || p.matchType === 'region')) {
+      unique.set(-1, {
+        name: region.name,
+        lat: region.lat,
+        lon: region.lon,
+        code: region.code,
+        matchType: 'region',
+      });
+    }
+
+    let places = [...unique.values()];
+    const cityPlacesInText = fromText.some((p) => p.kind === 'street' || p.kind === 'district');
+    const precise = places.filter((p) => p.matchType !== 'city');
+    if (precise.length) places = precise;
+    if (!cityPlacesInText && (input.geoScope === 'oblast' || input.geoScope === 'suburb' || region)) {
+      const outer = places.filter((p) => p.matchType === 'settlement' || p.matchType === 'region');
+      if (outer.length) places = outer;
+    }
+    return places;
+  }
+
+  async resolveAndLearn(names: string[], oblast?: string | null): Promise<ResolvedPlace[]> {
+    return this.resolveThreatPlaces({ text: names.join(' '), llmPlaces: names, oblast });
+  }
+
+  labelForCode(code: string | null | undefined): string {
+    if (!code) return 'Харків';
+    return this.toponyms.lookup(code)?.name ?? code;
+  }
+
+  findPlace(raw: string) {
+    return this.toponyms.lookup(raw);
+  }
+
+  nearestDistrictNorm(lat: number, lon: number): string | null {
+    return this.nearestOfKind(lat, lon, 'district')?.norm ?? null;
+  }
+
+  private nearestOfKind(lat: number, lon: number, kind: 'street' | 'district') {
+    let best: { name: string; norm: string } | null = null;
+    let bestKm = Infinity;
+    for (const place of this.toponyms.all()) {
+      if (place.kind !== kind) continue;
+      const km = this.haversineKm(lat, lon, place.lat, place.lon);
+      if (km < bestKm) {
+        bestKm = km;
+        best = place;
+      }
+    }
+    return best;
+  }
+
+  private toResolved(item: MemoryToponym): ResolvedPlace {
+    return {
+      name: item.name,
+      lat: item.lat,
+      lon: item.lon,
+      code: item.norm,
+      matchType: item.kind,
+    };
+  }
+
+  matchUser(
+    user: { lat: number | null; lon: number | null; oblastCode: string | null },
+    places: ResolvedPlace[],
+    opts?: { cityWide?: boolean },
+  ): { ok: boolean; km?: number; place?: ResolvedPlace } {
+    if (user.lat != null && user.lon != null && !this.isInKharkiv(user.lat, user.lon)) {
+      return { ok: false };
+    }
+    if (user.oblastCode === 'outside') return { ok: false };
+
+    const lat = user.lat ?? KHARKIV_CENTER.lat;
+    const lon = user.lon ?? KHARKIV_CENTER.lon;
+
+    if (opts?.cityWide) {
+      return {
+        ok: true,
+        km: this.haversineKm(lat, lon, KHARKIV_CENTER.lat, KHARKIV_CENTER.lon),
+        place: places.find((p) => p.matchType === 'city') ?? {
+          name: 'Харків',
+          lat: KHARKIV_CENTER.lat,
+          lon: KHARKIV_CENTER.lon,
+          code: 'харків',
+          matchType: 'city',
+        },
+      };
+    }
+
+    if (places.length === 0) return { ok: false };
+
+    let best: { km: number; place: ResolvedPlace } | null = null;
+    for (const place of places) {
+      const km = this.haversineKm(lat, lon, place.lat, place.lon);
+      if (!best || km < best.km) best = { km, place };
+    }
+    if (!best) return { ok: false };
+
+    const limit = NEARBY_KM[best.place.matchType] ?? 4;
+    if (best.km <= limit) {
+      return { ok: true, km: best.km, place: best.place };
+    }
+    return { ok: false, km: best.km, place: best.place };
+  }
+}
