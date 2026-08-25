@@ -7,7 +7,7 @@ import { TelegramService } from '../telegram/telegram.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { escapeHtml, previewMessage } from '../common/text';
 import { t } from '../common/i18n';
-import { threatLabel } from '../llm/threat-slang';
+import { alertWeaponCaption } from '../llm/threat-slang';
 import { ALERT_DEDUP_MS, eventKeysOverlap } from './event-key';
 
 export type AlertPayload = {
@@ -59,12 +59,14 @@ export class AlertsService {
       return;
     }
 
+    const cityWide =
+      payload.threatType === 'all_clear' &&
+      (payload.places.length === 0 || payload.places.every((p) => p.matchType === 'city'));
+
     const targets = users.filter((user) => {
       if (alreadyIds.has(user.id)) return false;
       if (user.lat == null && user.lon == null && !user.oblastCode) return false;
-      return this.geo.matchUser(user, payload.places, {
-        cityWide: payload.threatType === 'all_clear',
-      }).ok;
+      return this.geo.matchUser(user, payload.places, { cityWide }).ok;
     });
 
     this.logger.log(
@@ -73,9 +75,7 @@ export class AlertsService {
     );
     if (!targets.length && users.length && payload.places.length) {
       const sample = users.slice(0, 4).map((user) => {
-        const match = this.geo.matchUser(user, payload.places, {
-          cityWide: payload.threatType === 'all_clear',
-        });
+        const match = this.geo.matchUser(user, payload.places, { cityWide });
         const km = match.km != null ? match.km.toFixed(0) : '-';
         return `u${user.id} ${km}/${match.radiusKm ?? this.geo.userRadiusKm(user.radiusKm)}км`;
       });
@@ -118,7 +118,7 @@ export class AlertsService {
       where: {
         userId: user.id,
         sentAt: { gte: new Date(Date.now() - ALERT_DEDUP_MS) },
-        eventKey: { not: null },
+        eventKey: { not: '' },
       },
       select: { eventKey: true },
       take: 50,
@@ -127,15 +127,15 @@ export class AlertsService {
       return;
     }
 
-    const match = this.geo.matchUser(user, payload.places, {
-      cityWide: payload.threatType === 'all_clear',
-    });
+    const cityWide =
+      payload.threatType === 'all_clear' &&
+      (payload.places.length === 0 || payload.places.every((p) => p.matchType === 'city'));
+    const match = this.geo.matchUser(user, payload.places, { cityWide });
     const loc = user.locale;
     const place = match.place?.name ?? payload.places[0]?.name ?? 'Харків';
     const km =
       match.km != null ? t(loc, 'alert_distance', { km: String(Math.max(1, Math.round(match.km))) }) : '';
-    const kind =
-      payload.weaponRaw?.trim() || threatLabel(payload.threatType, loc);
+    const kind = alertWeaponCaption(payload.threatType, payload.weaponRaw, loc);
     const titleKey =
       payload.threatType === 'all_clear'
         ? 'alert_clear_title'
@@ -172,7 +172,7 @@ export class AlertsService {
         data: {
           userId: user.id,
           messageId: payload.messageId,
-          eventKey: payload.eventKey,
+          eventKey: payload.eventKey || '',
         },
       });
       this.logger.log(

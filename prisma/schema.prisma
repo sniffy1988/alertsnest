@@ -82,7 +82,7 @@ model User {
   isBanned          Boolean   @default(false)
   lat               Float?
   lon               Float?
-  radiusKm          Int       @default(40)
+  radiusKm          Int       @default(20)
   oblastCode        String?
   locationUpdatedAt DateTime?
   subscribedTo      Channel[] @relation("UserSubscriptions")
@@ -124,11 +124,11 @@ model AlertDelivery {
   id        Int      @id @default(autoincrement())
   userId    Int
   messageId Int
-  eventKey  String?
+  eventKey  String   @default("")
   sentAt    DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
 
-  @@unique([userId, messageId])
+  @@unique([userId, messageId, eventKey])
   @@index([userId, eventKey])
 }

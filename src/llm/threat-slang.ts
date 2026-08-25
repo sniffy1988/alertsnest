@@ -1,5 +1,5 @@
 import { normalize } from '../common/text';
-import { isAllClearPost, isContinuation, isEtaOnly, isTrackLost, leftOblast } from '../alerts/message-chain';
+import { isAllClearPost, isContinuation, isEtaOnly, isNoMoreLaunches, isTrackLost, leftOblast } from '../alerts/message-chain';
 
 export type ThreatKind =
   | 'shahed'
@@ -69,7 +69,7 @@ const SLANG: Array<{ needles: string[]; type: ThreatKind; allClear?: boolean }> 
   { needles: ['орешник', 'орешника', 'oreshnik'], type: 'ballistic' },
   { needles: ['баліст', 'баллист', 'іскандер', 'искандер'], type: 'ballistic' },
   { needles: ['-59', 'х-59', 'х59', 'x-59', 'x59'], type: 'kh59' },
-  { needles: ['каб', 'кабы', 'фаб', 'умпк', 'умпк'], type: 'kab' },
+  { needles: ['каб', 'кабы', 'фаб', 'умпк', 'умпк', 'бнр', 'б.н.р', 'б н р'], type: 'kab' },
   { needles: ['дорозвід', 'доразвед', 'розвідник', 'разведчик'], type: 'recon' },
   { needles: ['31к', 'міг-31', 'миг-31', 'ту-95', 'ту-22', 'ту-160', 'стратег'], type: 'aircraft' },
   { needles: ['рсзо', 'рсзв', 'залп граду', 'установки град', 'смерч', 'вільха', 'ольха'], type: 'mlrs' },
@@ -85,6 +85,41 @@ export function threatLabel(type: string | null | undefined, locale = 'ua'): str
   if (locale.startsWith('ru')) return pack.ru;
   if (locale.startsWith('en')) return pack.en;
   return pack.ua;
+}
+
+/** Prefer channel wording for named weapons; use localized label for generic «тривога/балістика». */
+export function alertWeaponCaption(
+  threatType: string | null | undefined,
+  weaponRaw: string | null | undefined,
+  locale = 'ua',
+): string {
+  const raw = weaponRaw?.trim();
+  if (raw && !isGenericWeaponRaw(raw)) return raw;
+  return threatLabel(threatType, locale);
+}
+
+function isGenericWeaponRaw(raw: string): boolean {
+  const n = normalize(raw)
+    .replace(/[''`ʼ]/g, '')
+    .replace(/[ъь]/g, '')
+    .replace(/і/g, 'и')
+    .replace(/ї/g, 'и')
+    .replace(/є/g, 'е')
+    .replace(/ґ/g, 'г')
+    .replace(/ё/g, 'е')
+    .replace(/[^a-zа-я0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!n || n.length < 2) return true;
+  // multi-word generics: «повітряна тривога», «воздушная угроза»
+  if (
+    /^(?:(?:повітрян\w*|воздушн\w*|тривог\w*|тревог\w*|загроз\w*|угроз\w*|балист\w*|баллист\w*|ракет\w*|в[иі]дб[иі]й|отбой|чисто|ппо|пво|бпла|alert|threat|missile)(?:\s+)?)+$/.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function detectThreatSlang(text: string): { type: ThreatKind; allClear: boolean } | null {
@@ -113,7 +148,7 @@ export function isThreatLabel(name: string): boolean {
     .trim();
   if (!n || n.length < 3) return true;
   if (
-    /^(балист\w*|баллист\w*|шахед\w*|шаболд\w*|мопед\w*|геран\w*|кинжал\w*|кинджал\w*|орешник\w*|калибр\w*|калібр\w*|іскандер\w*|искандер\w*|ракет\w*|каб\w*|фаб\w*|умпк|бпла\w*|ппо|пво|тривог\w*|тревог\w*|загроз\w*|угроз\w*|повітря|воздух|приліт\w*|прилет\w*|вибух\w*|взрыв\w*|бандерол\w*|oreshnik|shahed|kinzhal|iskander)$/.test(
+    /^(балист\w*|баллист\w*|шахед\w*|шаболд\w*|мопед\w*|геран\w*|кинжал\w*|кинджал\w*|орешник\w*|калибр\w*|калібр\w*|іскандер\w*|искандер\w*|ракет\w*|каб\w*|фаб\w*|умпк|бнр|бпла\w*|ппо|пво|тривог\w*|тревог\w*|загроз\w*|угроз\w*|повітря|воздух|приліт\w*|прилет\w*|вибух\w*|взрыв\w*|бандерол\w*|oreshnik|shahed|kinzhal|iskander)$/.test(
       n,
     )
   ) {
@@ -136,6 +171,16 @@ export function enrichThreatType(
   llmIsThreat: boolean,
   context: string[] = [],
 ): { threatType: string; isThreat: boolean; notify: boolean; fromSlang: boolean; trackLost: boolean } {
+  if (isNoMoreLaunches(text)) {
+    const local = detectThreatSlang(text);
+    return {
+      threatType: local?.type ?? llmType ?? 'none',
+      isThreat: false,
+      notify: false,
+      fromSlang: Boolean(local),
+      trackLost: false,
+    };
+  }
   const trackLost = isTrackLost(text);
   const left = leftOblast(text);
   const chained = context.length > 0 || isContinuation(text);

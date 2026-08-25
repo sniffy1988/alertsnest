@@ -10,12 +10,17 @@ export const OBLAST_BBOX = { minLat: 48.45, maxLat: 50.55, minLon: 34.75, maxLon
 export const PLACE_SLANG: Record<string, string> = {
   сс: foldUa('північна салтівка'),
   бд: foldUa('велика данилівка'),
+  козачка: foldUa('козача лопань'),
+  казачка: foldUa('козача лопань'),
+  'казачья лопань': foldUa('козача лопань'),
+  'кащачья лопань': foldUa('козача лопань'),
 };
 
 export function foldPlaceText(s: string): string {
   return foldUa(s)
     .replace(/(^|\s)с\s+с(?=\s|$)/g, '$1сс')
-    .replace(/(^|\s)б\s+д(?=\s|$)/g, '$1бд');
+    .replace(/(^|\s)б\s+д(?=\s|$)/g, '$1бд')
+    .replace(/(^|\s)ст\.?\s+/g, '$1старий ');
 }
 
 export function registerPlaceSlang(alias: string, meaning: string): void {
@@ -59,8 +64,8 @@ export function placeStem(s: string): string {
   const adj = n.replace(/(ового|овому|ової|овой)$/g, '');
   if (adj.length >= 5) n = adj;
   if (n.length >= 6) n = n.replace(/[аеиоуиюя]$/g, '');
-  // павлівка / павловка / кегичівка / кегичевка
-  n = n.replace(/[ие]вк/g, 'овк').replace(/[ие]в$/g, 'ов');
+  // UA/RU orthography only (павлівка ↔ павловка). Do NOT strip prefixes — Краснопавлівка ≠ Павлівка.
+  n = n.replace(/евк/g, 'ивк').replace(/овк/g, 'ивк');
   return n;
 }
 
@@ -214,8 +219,22 @@ export function preferRaionOverStemSiblings<T extends { name: string; kind?: Pla
   const raions = items.filter((item) => kindOf(item) === 'region' && /район/i.test(item.name));
   if (!raions.length) return items;
   const mentioned = raions.filter((item) => mentionedIn(text, item.name));
-  const keep = mentioned.length ? mentioned : raions;
-  return keep;
+  const keepRaions = mentioned.length ? mentioned : raions;
+  const raionStems = new Set(
+    keepRaions.map((item) => placeStem(item.name)).filter((stem) => stem.length >= 4),
+  );
+  return items.filter((item) => {
+    if (keepRaions.includes(item)) return true;
+    if (kindOf(item) === 'region' && /район/i.test(item.name)) return false;
+    const stem = placeStem(item.name);
+    if (
+      raionStems.has(stem) &&
+      (kindOf(item) === 'settlement' || kindOf(item) === 'street' || kindOf(item) === 'district')
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 /** Among stem-siblings, keep only items that the text actually refers to. */
@@ -305,6 +324,37 @@ export function isCityWideKharkivCue(text: string): boolean {
       n,
     );
   return city && wide;
+}
+
+/**
+ * Normalize LLM place strings that are not a single toponym.
+ * e.g. «Харків та передмістя» → Харків/city; «Чугуївський район» → region.
+ */
+export function normalizeLlmPlace(
+  name: string,
+  kind: PlaceKind,
+): { name: string; kind: PlaceKind } {
+  const trimmed = name.trim();
+  const n = foldUa(trimmed);
+  if (
+    /^(харків|харьков|kharkiv)(\s+(та|и|і)\s+(передміст\w*|пригород\w*|околиц\w*))?$/.test(n) ||
+    /^(харків|харьков|kharkiv)\s+(та|и|і)\s+(передміст|пригород)/.test(n)
+  ) {
+    return { name: 'Харків', kind: 'city' };
+  }
+  if (/ськ[иі]й\s+район$|ск[иі]й\s+район$/.test(n) && (kind === 'district' || kind === 'settlement')) {
+    return { name: trimmed, kind: 'region' };
+  }
+  return { name: trimmed, kind };
+}
+
+/** Split «Прудянка и Слатино» / «A/B» into separate place labels. */
+export function splitCompoundPlaceNames(name: string): string[] {
+  const parts = name
+    .split(/\s*(?:\/|,|;|\s+та\s+|\s+и\s+|\s+і\s+|\s+й\s+)\s*/i)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+  return parts.length > 1 ? parts : [name.trim()].filter((s) => s.length >= 2);
 }
 
 /** Drop labels that are not worth geocoding / admin explain prompts. */

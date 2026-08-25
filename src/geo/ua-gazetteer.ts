@@ -127,7 +127,7 @@ export const GAZETTEER: GazetteerPlace[] = [
     lon: 35.872,
     kind: 'region',
   },
-  { code: 'kozacha_lopan', name: 'Козача Лопань', aliases: ['козача лопань', 'казачья лопань'], lat: 50.333, lon: 36.2, kind: 'settlement' },
+  { code: 'kozacha_lopan', name: 'Козача Лопань', aliases: ['козача лопань', 'казачья лопань', 'кащачья лопань', 'козачка', 'казачка'], lat: 50.333, lon: 36.2, kind: 'settlement' },
   { code: 'vovchansk', name: 'Вовчанськ', aliases: ['вовчанськ', 'волчанск'], lat: 50.288, lon: 36.946, kind: 'settlement' },
   { code: 'kupyansk', name: "Куп'янськ", aliases: ["куп'янськ", 'купянск', 'купянськ'], lat: 49.71, lon: 37.617, kind: 'settlement' },
   { code: 'izium', name: 'Ізюм', aliases: ['ізюм', 'изюм'], lat: 49.213, lon: 37.257, kind: 'settlement' },

@@ -6,6 +6,8 @@ export function cleanMessage(text: string): string {
   return text
     .replace(/[’ʼ]/g, "'")
     .replace(/✅?\s*підпишись на схід\.?/gi, '')
+    .replace(/✅?\s*підпишись на\s+\S+/gi, '')
+    .replace(/✅?\s*подпишись на\s+\S+/gi, '')
     .replace(/https?:\/\/\S+/g, '')
     .replace(/[^\S\r\n]+/g, ' ')
     .trim();

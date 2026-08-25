@@ -11,6 +11,7 @@ import {
   isContinuation,
   isEtaOnly,
   isNoisePost,
+  isNoMoreLaunches,
   leftOblast,
   resolveChainFromKnown,
   type ChainMessage,
@@ -56,20 +57,20 @@ export class PipelineService {
     this.waitMs = Math.max(500, Number(config.get('LLM_BATCH_WAIT_MS') ?? 2000));
   }
 
-  enqueue(items: BufferedMessage[]): void {
+  enqueue(items: BufferedMessage[]): number {
     const queued = new Set(this.buffer.map((item) => item.dbId));
     const fresh = items.filter((item) => {
       if (queued.has(item.dbId) || this.inFlight.has(item.dbId)) return false;
       queued.add(item.dbId);
       return true;
     });
-    if (!fresh.length) return;
+    if (!fresh.length) return 0;
     this.buffer.push(...fresh);
     this.metrics.bufferSize = this.buffer.length;
     this.logger.debug(`enqueue +${fresh.length} buffer=${this.buffer.length}`);
     if (this.buffer.length >= this.batchSize) {
       void this.flush();
-      return;
+      return fresh.length;
     }
     if (!this.flushTimer) {
       this.flushTimer = setTimeout(() => {
@@ -77,6 +78,7 @@ export class PipelineService {
         void this.flush();
       }, this.waitMs);
     }
+    return fresh.length;
   }
 
   private async flush(): Promise<void> {
@@ -105,7 +107,9 @@ export class PipelineService {
       );
 
       if (results.length === 0) {
-        this.logger.warn('empty LLM result, dropping batch');
+        this.logger.warn('empty LLM result, requeue batch');
+        this.buffer.unshift(...batch);
+        this.metrics.bufferSize = this.buffer.length;
         return;
       }
 
@@ -121,6 +125,11 @@ export class PipelineService {
           this.logger.debug(`msg ${item.dbId} noise/donate, skip`);
           continue;
         }
+        if (isNoMoreLaunches(item.text)) {
+          await this.persistAnalysis(item.dbId, analysis, null);
+          this.logger.log(`msg ${item.dbId} no more launches, skip`);
+          continue;
+        }
         if (isEtaOnly(item.text)) {
           this.logger.log(`msg ${item.dbId} ETA only, no push`);
         }
@@ -133,7 +142,9 @@ export class PipelineService {
             ? `${chain.context[chain.context.length - 1]}\n${item.text}`
             : item.text;
 
-        const events = this.eventsForGeo(analysis);
+        // Always scan the gazetteer — primary place source (LLM names are merged on top).
+        const scanned = this.geo.findPlacesInText(placeText);
+        const events = this.eventsForGeo(analysis, placeText, scanned);
         const storedPlaces: Array<{
           place: ResolvedPlace;
           weapon: string;
@@ -145,10 +156,12 @@ export class PipelineService {
           const resolved = await this.geo.resolveThreatPlaces({
             text: placeText,
             locations: [{ name: event.name, kind: event.kind }],
+            skipLearn: scanned.length > 0,
           });
-          let places = [...resolved.places];
+          // Union: keep scan hits even when LLM grounding/lookup fails.
+          let places = this.geo.mergePlaces(scanned, resolved.places);
 
-          if (event.weapon === 'all_clear' && !places.some((p) => p.matchType === 'city')) {
+          if (event.weapon === 'all_clear' && places.length === 0) {
             const city = this.geo.findPlace('Харків', 'city');
             if (city) {
               places = [
@@ -165,7 +178,10 @@ export class PipelineService {
 
           this.logger.log(
             `msg ${item.dbId} @${item.channel} event weapon=${event.weapon} raw=${event.weaponRaw ?? '-'} ` +
-              `loc=${event.name}/${event.kind} resolved=[${places.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
+              `loc=${event.name}/${event.kind} ` +
+              `scan=[${scanned.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
+              `llm=[${resolved.places.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
+              `resolved=[${places.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
               `foreign=[${resolved.foreign.join(', ')}] unknown=[${resolved.unknown.join(', ')}] ` +
               `lost=${analysis.trackLost} chain=${chain?.context.length ?? 0}`,
           );
@@ -205,6 +221,10 @@ export class PipelineService {
           if (!firstKey) firstKey = eventKey;
 
           if (!analysis.notify) continue;
+          if (!analysis.isThreat && event.weapon !== 'all_clear') {
+            this.logger.log(`msg ${item.dbId} not a threat (weapon=${event.weapon}), skip pair`);
+            continue;
+          }
           if (event.weapon === 'all_clear' && !isAllClearPost(item.text)) {
             this.logger.log(`msg ${item.dbId} all_clear without відбій/отбой, skip pair`);
             continue;
@@ -279,9 +299,22 @@ export class PipelineService {
     }
   }
 
-  private eventsForGeo(analysis: LlmResultItem): LlmEvent[] {
+  private eventsForGeo(
+    analysis: LlmResultItem,
+    placeText: string,
+    scanned: ResolvedPlace[],
+  ): LlmEvent[] {
     if (analysis.events.length) return analysis.events;
     if (analysis.threatType === 'all_clear') {
+      const hits = scanned.filter((h) => h.matchType !== 'street');
+      if (hits.length) {
+        return hits.map((h) => ({
+          weapon: 'all_clear' as const,
+          weaponRaw: null,
+          name: h.name,
+          kind: h.matchType,
+        }));
+      }
       return [
         {
           weapon: 'all_clear',
@@ -290,6 +323,35 @@ export class PipelineService {
           kind: 'city' as PlaceKind,
         },
       ];
+    }
+    // Trajectory update / empty LLM places — recover toponyms from gazetteer scan.
+    if (
+      analysis.notify &&
+      analysis.threatType &&
+      analysis.threatType !== 'none' &&
+      analysis.threatType !== 'other'
+    ) {
+      if (scanned.length) {
+        this.logger.log(
+          `events fallback from text: type=${analysis.threatType} places=[${scanned.map((h) => h.name).join(', ')}]`,
+        );
+        return scanned.map((h) => ({
+          weapon: analysis.threatType as LlmEvent['weapon'],
+          weaponRaw: null,
+          name: h.name,
+          kind: h.matchType,
+        }));
+      }
+      // Still scan again if caller passed empty (defensive).
+      const hits = this.geo.findPlacesInText(placeText);
+      if (hits.length) {
+        return hits.map((h) => ({
+          weapon: analysis.threatType as LlmEvent['weapon'],
+          weaponRaw: null,
+          name: h.name,
+          kind: h.matchType,
+        }));
+      }
     }
     return [];
   }
@@ -309,7 +371,7 @@ export class PipelineService {
         summary: analysis.summaryUk,
         eventKey,
         rawJson: JSON.stringify(analysis),
-        model: 'qwen2.5-3b-m2:latest',
+        model: this.llm.modelName,
       },
       update: {
         isThreat: analysis.isThreat,

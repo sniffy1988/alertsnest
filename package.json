@@ -2,7 +2,7 @@
   "name": "alertsnest",
   "version": "1.0.0",
   "private": true,
-  "description": "Geo-aware Telegram threat alerts via local qwen2.5-3b-m2",
+  "description": "Geo-aware Telegram threat alerts via local qwen3.5:2b-mlx",
   "license": "ISC",
   "scripts": {
     "build": "nest build",
@@ -10,7 +10,8 @@
     "start:dev": "nest start --watch",
     "dev": "tsx watch src/main.ts",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate deploy"
+    "prisma:migrate": "prisma migrate deploy",
+    "toponyms:download": "tsx scripts/download-toponyms.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.6",
@@ -22,7 +23,7 @@
     "axios": "^1.11.0",
     "cheerio": "^1.1.2",
     "grammy": "^1.37.0",
-    "ollama": "^0.5.17",
+    "ollama": "^0.6.3",
     "prisma": "^6.14.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"

@@ -27,13 +27,13 @@ docker compose up -d
 
 Health: `http://127.0.0.1:8080/health`
 
-SQLite лежит в volume `alerts-data`, веса Ollama — в `ollama-data`. Если кастомной `qwen2.5-3b-m2:latest` нет в реестре Ollama, задай публичную модель в `.env`:
+SQLite лежит в volume `alerts-data`, веса Ollama — в `ollama-data`. Модель по умолчанию — `qwen3.5:2b-mlx` (Apple Silicon / M2). Сменить в `.env`:
 
 ```bash
-OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_MODEL=qwen3.5:2b-mlx
 ```
 
-и перезапусти `docker compose up -d`.
+и перезапусти `docker compose up -d` (сервис `ollama-pull` скачает веса). На Linux без Apple GPU используй `qwen3.5:2b`.
 
 Собрать локально без образа из GHCR:
 

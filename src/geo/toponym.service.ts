@@ -11,6 +11,7 @@ import {
 } from './geocode-rank';
 import {
   dropStreetShadows,
+  dropStemSiblings,
   expandAliases,
   expandPlaceSlang,
   foldPlaceText,
@@ -25,11 +26,18 @@ import {
   placeForms,
   placeStem,
   placeVariants,
+  preferRaionOverStemSiblings,
   queryLooksLikeStreet,
   registerPlaceSlang,
   tokenRefersToName,
 } from './place-match';
 import { isThreatLabel } from '../llm/threat-slang';
+import {
+  downloadGeonamesDump,
+  dumpFilePath,
+  readPlacesDump,
+  type DumpPlace,
+} from './geonames-dump';
 
 export type ToponymKind = PlaceKind;
 
@@ -79,7 +87,7 @@ function oblastSettlementQueries(): string[] {
     ([s, w, n, e]) =>
       `
 [out:json][timeout:45];
-node["place"~"town|village|hamlet|isolated_dwelling"]["name"](${s},${w},${n},${e});
+node["place"~"city|town|village|hamlet|isolated_dwelling"]["name"](${s},${w},${n},${e});
 out tags;
 `.trim(),
   );
@@ -120,6 +128,7 @@ export class ToponymService implements OnModuleInit {
     await this.ensureSeed();
     await this.refreshMemory();
     await this.sweepResolvedUnknowns();
+    await this.ensureGeonamesDump();
     await this.ensureOsmImports();
     this.logger.log(`Toponym dictionary ready: ${this.items.length}`);
   }
@@ -131,6 +140,7 @@ export class ToponymService implements OnModuleInit {
   lookup(raw: string, preferredKind?: ToponymKind | null): MemoryToponym | null {
     const key = normalize(raw);
     if (!key) return null;
+    let exactFallback: MemoryToponym | null = null;
     for (const variant of placeVariants(raw)) {
       const exact = this.byNorm.get(variant) ?? this.byNorm.get(normalize(variant)) ?? this.byNorm.get(foldUa(variant));
       if (!exact) continue;
@@ -144,6 +154,7 @@ export class ToponymService implements OnModuleInit {
         );
         if (sameKind) return sameKind;
         if (exact.kind === preferredKind) return exact;
+        if (exact.kind !== 'street' || queryLooksLikeStreet(raw)) exactFallback ??= exact;
         continue;
       }
       if (exact.kind !== 'street' || queryLooksLikeStreet(raw)) return exact;
@@ -155,7 +166,7 @@ export class ToponymService implements OnModuleInit {
     }
 
     const queryStem = placeStem(raw);
-    if (queryStem.length < 5) return null;
+    if (queryStem.length < 5) return exactFallback;
 
     const scored = (wantKind: ToponymKind | null | undefined): MemoryToponym | null => {
       const wantStreet = wantKind === 'street' || queryLooksLikeStreet(raw);
@@ -198,7 +209,8 @@ export class ToponymService implements OnModuleInit {
       return best;
     };
 
-    return scored(preferredKind) ?? (preferredKind ? scored(null) : null);
+    // Prefer exact/kind match; do not fall back across kinds when a kind was requested.
+    return scored(preferredKind) ?? exactFallback ?? (preferredKind ? null : scored(null));
   }
 
   findInText(text: string): MemoryToponym[] {
@@ -257,7 +269,8 @@ export class ToponymService implements OnModuleInit {
       if (longer) continue;
       hits.set(row.item.id, row.item);
     }
-    return dropStreetShadows([...hits.values()], text);
+    const raw = [...hits.values()];
+    return preferRaionOverStemSiblings(dropStemSiblings(dropStreetShadows(raw, text), text), text);
   }
 
   async explain(
@@ -685,7 +698,6 @@ export class ToponymService implements OnModuleInit {
         timeout: 12_000,
         params: {
           q: name,
-          lang: 'uk',
           limit: 10,
           lat: hint?.lat ?? KHARKIV_CENTER.lat,
           lon: hint?.lon ?? KHARKIV_CENTER.lon,
@@ -769,6 +781,54 @@ export class ToponymService implements OnModuleInit {
     }
   }
 
+  private async ensureGeonamesDump(): Promise<boolean> {
+    const path = dumpFilePath();
+    let dump = readPlacesDump(path);
+    if (!dump) {
+      try {
+        this.logger.log('GeoNames dump missing, downloading UA.zip…');
+        dump = await downloadGeonamesDump(path);
+      } catch (err) {
+        this.logger.warn(`GeoNames download skipped: ${err instanceof Error ? err.message : err}`);
+        return false;
+      }
+    }
+    const added = await this.importDumpPlaces(dump.places);
+    this.logger.log(`GeoNames dump ${dump.places.length} places, added ${added} (${path})`);
+    if (added) await this.refreshMemory();
+    return true;
+  }
+
+  private async importDumpPlaces(places: DumpPlace[]): Promise<number> {
+    let added = 0;
+    for (const place of places) {
+      if (this.lookup(place.name) || place.aliases.some((alias) => this.lookup(alias))) continue;
+      const official = place.name.trim();
+      const norm = normalize(official);
+      if (!norm || this.byNorm.has(norm) || this.byNorm.has(foldUa(official))) continue;
+      try {
+        const aliases = expandAliases(official, [normalize(official), foldUa(official), ...place.aliases], 48);
+        const row = await this.prisma.toponym.create({
+          data: {
+            name: official,
+            norm,
+            aliases: JSON.stringify(aliases),
+            lat: place.lat,
+            lon: place.lon,
+            kind: place.kind,
+            source: 'geonames',
+            hitCount: 0,
+          },
+        });
+        this.index(this.toMemory(row));
+        added += 1;
+      } catch {
+        // unique race / duplicate
+      }
+    }
+    return added;
+  }
+
   private async ensureOsmImports(): Promise<void> {
     const osmCity = await this.prisma.toponym.count({
       where: { source: 'osm', kind: { in: ['street', 'district'] } },
@@ -776,6 +836,7 @@ export class ToponymService implements OnModuleInit {
     const oblastDone = await this.prisma.toponym.findUnique({
       where: { norm: '__osm_oblast_done__' },
     });
+    const hasDump = Boolean(readPlacesDump());
 
     if (osmCity === 0) {
       try {
@@ -787,7 +848,7 @@ export class ToponymService implements OnModuleInit {
       }
     }
 
-    if (!oblastDone) {
+    if (!oblastDone && !hasDump) {
       // Heavy; don't block Nest boot if mirrors are slow — retry next restart on failure.
       void this.importOblastSettlements().catch((err) => {
         this.logger.warn(`OSM oblast import skipped: ${err instanceof Error ? err.message : err}`);

@@ -7,6 +7,8 @@ import {
   isPlausiblePlaceLabel,
   isVagueOblastName,
   mentionedIn,
+  normalizeLlmPlace,
+  tokenRefersToName,
 } from './place-match';
 import { isThreatLabel } from '../llm/threat-slang';
 
@@ -30,7 +32,7 @@ export type LlmLocationInput = {
 };
 
 const CITY_RADIUS_KM = 22;
-const DEFAULT_USER_RADIUS_KM = 40;
+const DEFAULT_USER_RADIUS_KM = 20;
 const MIN_USER_RADIUS_KM = 5;
 const MAX_USER_RADIUS_KM = 150;
 
@@ -78,30 +80,41 @@ export class GeoService {
     return Math.min(MAX_USER_RADIUS_KM, Math.max(MIN_USER_RADIUS_KM, raw));
   }
 
-  /** Resolve only LLM-provided location names (no full-text gazetteer scan). */
+  /**
+   * Resolve LLM-provided location names. Gazetteer scan is done separately and merged by the caller.
+   * When `skipLearn` is set (scan already found local hits), do not Nominatim-guess new points.
+   */
   async resolveThreatPlaces(input: {
     text: string;
     locations: LlmLocationInput[];
+    skipLearn?: boolean;
   }): Promise<ThreatPlaceResolve> {
     const foreign: string[] = [];
     const unknown: string[] = [];
     const unique = new Map<string, ResolvedPlace>();
 
     for (const loc of input.locations) {
-      const name = loc.name.trim();
+      const normalized = normalizeLlmPlace(loc.name.trim(), loc.kind);
+      const name = normalized.name;
+      const kind = normalized.kind;
       if (name.length < 2 || isVagueOblastName(name) || isThreatLabel(name)) continue;
       if (!isPlausiblePlaceLabel(name)) continue;
-      if (!this.isGrounded(input.text, name, loc.kind)) continue;
+      if (!this.isGrounded(input.text, name, kind)) continue;
 
-      const lookedUp = this.toponyms.lookup(name, loc.kind);
+      const lookedUp = this.toponyms.lookup(name, kind);
       if (lookedUp) {
         unique.set(lookedUp.norm, this.toResolved(lookedUp));
         continue;
       }
 
+      if (input.skipLearn) {
+        if (isPlausiblePlaceLabel(name)) unknown.push(name);
+        continue;
+      }
+
       const hint =
         this.toponyms.lookup('Харків', 'city') ?? this.toponyms.lookup('Харків');
-      const [learned] = await this.toponyms.learn([name], hint, loc.kind);
+      const [learned] = await this.toponyms.learn([name], hint, kind);
       if (!learned) {
         if (isPlausiblePlaceLabel(name)) unknown.push(name);
         continue;
@@ -118,6 +131,17 @@ export class GeoService {
       foreign: [...new Set(foreign)],
       unknown: [...new Set(unknown)],
     };
+  }
+
+  /** Merge place lists by code (norm), preferring earlier entries. */
+  mergePlaces(...lists: ResolvedPlace[][]): ResolvedPlace[] {
+    const unique = new Map<string, ResolvedPlace>();
+    for (const list of lists) {
+      for (const place of list) {
+        if (!unique.has(place.code)) unique.set(place.code, place);
+      }
+    }
+    return [...unique.values()];
   }
 
   async resolveAndLearn(
@@ -142,16 +166,36 @@ export class GeoService {
     return this.toponyms.lookup(raw, kind);
   }
 
+  findPlacesInText(text: string): ResolvedPlace[] {
+    return this.toponyms.findInText(text).map((p) => this.toResolved(p));
+  }
+
   nearestDistrictNorm(lat: number, lon: number): string | null {
     return this.nearestOfKind(lat, lon, 'district')?.norm ?? null;
   }
 
-  /** City default (Харків) may be injected by LLM without appearing in text. */
+  /**
+   * City default (Харків) may be injected by LLM without appearing in text.
+   * Ground via whole-token / declined forms / slang — not only exact LLM spelling substring.
+   */
   private isGrounded(text: string, name: string, kind: PlaceKind): boolean {
     if (kind === 'city' && /^(харків|харьков|kharkiv|kharkov)$/i.test(foldUa(name))) {
       return true;
     }
-    return mentionedIn(text, name);
+    if (mentionedIn(text, name)) return true;
+
+    // LLM often returns nominative while the post has a case form, or a gazetteer alias.
+    const hit = this.toponyms.lookup(name, kind) ?? this.toponyms.lookup(name);
+    if (hit) {
+      if (mentionedIn(text, hit.name)) return true;
+      for (const alias of hit.aliases) {
+        if (mentionedIn(text, alias)) return true;
+      }
+    }
+
+    const folded = foldUa(text);
+    if (!folded) return false;
+    return folded.split(' ').some((token) => tokenRefersToName(token, name));
   }
 
   private nearestOfKind(lat: number, lon: number, kind: PlaceKind) {

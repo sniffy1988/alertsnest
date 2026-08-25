@@ -67,7 +67,7 @@ export class ScraperService implements OnModuleInit, OnModuleDestroy {
     try {
       const html = await fetchChannelHtml(channel.link);
       const after = Number(channel.lastTelegramId);
-      const { messages, maxTelegramId } = parseChannelHtml(html);
+      const { messages, maxTelegramId } = parseChannelHtml(html, after);
 
       const fresh = [];
       for (const msg of messages) {
@@ -115,11 +115,13 @@ export class ScraperService implements OnModuleInit, OnModuleDestroy {
       }
 
       if (fresh.length) {
-        const toAlert = fresh.filter((f) => f.alert).length;
-        this.logger.log(
-          `@${channel.link} queued=${fresh.length} alert=${toAlert} learn=${fresh.length - toAlert} lastId=${maxTelegramId ?? after}`,
-        );
-        this.pipeline.enqueue(fresh);
+        const queued = this.pipeline.enqueue(fresh);
+        if (queued) {
+          const toAlert = fresh.filter((f) => f.alert).length;
+          this.logger.log(
+            `@${channel.link} queued=${queued} alert=${toAlert} learn=${fresh.length - toAlert} lastId=${maxTelegramId ?? after}`,
+          );
+        }
       }
       this.clearBackoff(channel.id);
     } catch (err) {
