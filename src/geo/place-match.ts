@@ -1,7 +1,7 @@
 import { normalize } from '../common/text';
 import type { PlaceKind } from './ua-gazetteer';
 
-const OBLAST_BBOX = { minLat: 48.45, maxLat: 50.55, minLon: 34.75, maxLon: 38.15 };
+export const OBLAST_BBOX = { minLat: 48.45, maxLat: 50.55, minLon: 34.75, maxLon: 38.15 };
 
 export function foldUa(s: string): string {
   return normalize(s)
@@ -66,7 +66,8 @@ export function placeStem(s: string): string {
     .trim();
   if (n.length < 6) return n;
   n = n.replace(/(ського|ского|ській|ской|ська|ская|ське|ское|ський|ский)$/g, '');
-  n = n.replace(/(ового|овому|ової|овой|ове|ова|ове)$/g, '');
+  const adj = n.replace(/(ового|овому|ової|овой)$/g, '');
+  if (adj.length >= 5) n = adj;
   if (n.length >= 6) n = n.replace(/[аеиоуиюя]$/g, '');
   // павлівка / павловка / кегичівка / кегичевка
   n = n.replace(/[ие]вк/g, 'овк').replace(/[ие]в$/g, 'ов');
@@ -166,6 +167,81 @@ export function isVagueOblastName(name: string): boolean {
     n === 'околиці' ||
     n === 'околицы'
   );
+}
+
+/** Cities / oblasts that air channels mention but we do not alert on. */
+const OUTSIDE_CITY_RE: Array<{ name: string; re: RegExp }> = [
+  { name: 'Київ', re: /(?:^|\s)(ки[иеє]в|киев|kyiv|kiev)(?!ськ|ск)(?:а|у|е|і|ом)?(?:\s|$)/ },
+  { name: 'Полтава', re: /(?:^|\s)полтав(?:а|у|и|і|е|ой)?(?:\s|$)/ },
+  { name: 'Суми', re: /(?:^|\s)(суми|сумы|сум[уиы])(?:\s|$)/ },
+  { name: 'Дніпро', re: /(?:^|\s)(дн[иі]про|днепр)(?:а|у|е|о)?(?:\s|$)/ },
+  { name: 'Чернігів', re: /(?:^|\s)черн[иі]г[иі]в(?:а|у|е|і)?(?:\s|$)/ },
+  { name: 'Запоріжжя', re: /(?:^|\s)запор[иі]ж(?:жя|ье|жя|жжя)?(?:\s|$)/ },
+  { name: 'Донецьк', re: /(?:^|\s)донецьк(?:а|у|е)?(?:\s|$)/ },
+  { name: 'Луганськ', re: /(?:^|\s)луганськ(?:а|у|е)?(?:\s|$)/ },
+  { name: 'Одеса', re: /(?:^|\s)одес(?:а|у|и|і)?(?:\s|$)/ },
+  { name: 'Миколаїв', re: /(?:^|\s)микола[їи]в(?:а|у|е)?(?:\s|$)/ },
+  { name: 'Херсон', re: /(?:^|\s)херсон(?:а|у|е|і)?(?:\s|$)/ },
+  { name: 'Черкаси', re: /(?:^|\s)черкас(?:и|ы)?(?:\s|$)/ },
+  { name: 'Кропивницький', re: /(?:^|\s)(кропивниц|к[іі]ровоград)(?:ький|ский|а|у)?(?:\s|$)/ },
+  { name: 'Вінниця', re: /(?:^|\s)в[иі]нниц(?:я|а|ю|у|і)?(?:\s|$)/ },
+  { name: 'Житомир', re: /(?:^|\s)житомир(?:а|у|е|і)?(?:\s|$)/ },
+  { name: 'Бєлгород', re: /(?:^|\s)б[єе]лгород(?:а|у|е|і)?(?:\s|$)/ },
+];
+
+function stripKharkivFalseFriends(folded: string): string {
+  return folded
+    .replace(/ки[иеє]вськ\w*\s+район/g, ' ')
+    .replace(/киевск\w*\s+район/g, ' ')
+    .replace(/полтавськ\w*\s+шлях/g, ' ')
+    .replace(/полтавск\w*\s+шлях/g, ' ')
+    .replace(/сумськ\w*\s+вул/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function findOutsideCities(text: string, extra: string[] = []): string[] {
+  const n = stripKharkivFalseFriends(foldUa([text, ...extra].filter(Boolean).join(' ')));
+  if (!n) return [];
+  if (
+    /полтавськ\w*\s+област|полтавск\w*\s+област|ки[иеє]вськ\w*\s+област|киевск\w*\s+област|сумськ\w*\s+област|сумск\w*\s+област/.test(
+      n,
+    )
+  ) {
+    const oblast: string[] = [];
+    if (/полтавськ|полтавск/.test(n)) oblast.push('Полтавська область');
+    if (/ки[иеє]вськ|киевск/.test(n)) oblast.push('Київська область');
+    if (/сумськ|сумск/.test(n)) oblast.push('Сумська область');
+    return [...new Set(oblast)];
+  }
+  const hits: string[] = [];
+  for (const row of OUTSIDE_CITY_RE) {
+    if (row.re.test(n)) hits.push(row.name);
+  }
+  return hits;
+}
+
+export function hasKharkivLocalCue(text: string): boolean {
+  const n = foldUa(text);
+  return /харк[иі]в|харьков|kharkiv|салт[иі]в|олекс[иі]|хтз|п[иі]сочин|дергач|циркун|липц|данилив|науков|немишл|роган|холодна гора|ки[иеє]вськ\w*\s+район|полтавськ\w*\s+шлях|ст салтов|старий салтов/.test(
+    n,
+  );
+}
+
+export function isForeignOnlyThreat(text: string, extra: string[] = []): boolean {
+  const foreign = findOutsideCities(text, extra);
+  if (!foreign.length) return false;
+  return !hasKharkivLocalCue(text);
+}
+
+export function nominativeGuesses(name: string): string[] {
+  const raw = name.trim();
+  const folded = foldUa(raw);
+  const out = new Set<string>([raw, folded].filter(Boolean));
+  if (folded.length >= 5 && /у$/.test(folded)) out.add(folded.replace(/у$/, 'а'));
+  if (folded.length >= 5 && /ю$/.test(folded)) out.add(folded.replace(/ю$/, 'я'));
+  if (folded.length >= 5 && /ою$/.test(folded)) out.add(folded.replace(/ою$/, 'а'));
+  return [...out];
 }
 
 function escapeRe(s: string): string {

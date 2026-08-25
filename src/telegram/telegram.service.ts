@@ -17,6 +17,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private bot: Bot | null = null;
   private readonly adminIds: Set<string>;
   private readonly wait = new Map<number, WaitKind>();
+  private readonly placeDraft = new Map<number, string>();
 
   constructor(
     private readonly config: ConfigService,
@@ -46,7 +47,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       { command: 'language', description: 'Language' },
       { command: 'where', description: 'Street or district (Desktop)' },
       { command: 'addchannel', description: 'Admin: add channel' },
-      { command: 'place', description: 'Admin: alias = known place' },
+      { command: 'place', description: 'Admin: explain place (geocodes if new)' },
       { command: 'places', description: 'Admin: unexplained toponyms' },
     ]);
     void this.bot.start({
@@ -256,6 +257,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (!user) return;
     const rest = ctx.message?.text?.replace(/^\/place(@\w+)?\s*/i, '').trim() ?? '';
     if (!rest) {
+      this.placeDraft.delete(ctx.from!.id);
       this.wait.set(ctx.from!.id, 'place');
       await ctx.reply(t(user.locale, 'admin_ask_place'));
       return;
@@ -291,7 +293,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           (row.sampleText ? `\n   ${previewMessage(row.sampleText, 80)}` : ''),
       ),
       '',
-      t(locale, 'admin_ask_place'),
+      t(locale, 'unknown_place_how', { alias: rows[0]?.label ?? 'СС' }),
     ];
     const keyboard = new InlineKeyboard();
     for (const row of rows.slice(0, 8)) {
@@ -315,7 +317,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const admins = await this.prisma.user.findMany({
       where: { isAdmin: true, isBanned: false, telegramId: { not: null } },
     });
-    const guesses = stored.created.join(', ');
+    const guesses = stored.created.map((row) => row.label).join(', ');
+    const teachId = stored.created[0]?.id;
+    const example = stored.created[0]?.label ?? guesses.split(', ')[0] ?? 'СС';
     for (const admin of admins) {
       if (admin.telegramId == null) continue;
       const loc = admin.locale;
@@ -323,10 +327,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         `<b>${escapeHtml(t(loc, 'unknown_place_title'))}</b>`,
         `@${escapeHtml(input.channel)}: ${escapeHtml(previewMessage(input.text, 220))}`,
         escapeHtml(t(loc, 'unknown_place_guess', { places: guesses })),
+        '',
+        escapeHtml(t(loc, 'unknown_place_how', { alias: example })),
+        `<code>${escapeHtml(`${example} = `)}</code>`,
         escapeHtml(t(loc, 'unknown_place_saved')),
       ].join('\n');
       const keyboard = new InlineKeyboard()
-        .text(t(loc, 'admin_add_place'), 'admin_add_place')
+        .text(t(loc, 'admin_add_place'), teachId != null ? `teach:${teachId}` : 'admin_add_place')
         .text(t(loc, 'admin_list_places'), 'admin_list_places');
       try {
         if (!this.bot) return;
@@ -341,13 +348,28 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async savePlaceAlias(ctx: Context, locale: string, raw: string): Promise<void> {
-    const parsed = parsePlaceAlias(raw);
+    const fromId = ctx.from?.id;
+    const draft = fromId != null ? this.placeDraft.get(fromId) : undefined;
+    if (fromId != null) this.placeDraft.delete(fromId);
+    const parsed = parsePlaceAlias(raw) ?? (draft && raw.trim().length >= 2
+      ? { alias: draft, meaning: raw.trim() }
+      : raw.trim().length >= 2 && !raw.includes('=')
+        ? { alias: raw.trim(), meaning: raw.trim() }
+        : null);
     if (!parsed) {
       await ctx.reply(t(locale, 'admin_ask_place'));
       return;
     }
     const result = await this.toponyms.explain(parsed.alias, parsed.meaning);
+    if (!result.ok && result.reason === 'foreign') {
+      await ctx.reply(t(locale, 'admin_place_foreign', { name: parsed.meaning }));
+      return;
+    }
     if (!result.ok && result.reason === 'unknown_target') {
+      if (fromId != null) {
+        this.placeDraft.set(fromId, parsed.alias);
+        this.wait.set(fromId, 'place');
+      }
       await ctx.reply(t(locale, 'admin_place_unknown_target', { name: parsed.meaning }));
       return;
     }
@@ -355,7 +377,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       await ctx.reply(t(locale, 'admin_ask_place'));
       return;
     }
-    await ctx.reply(t(locale, 'admin_place_added', { alias: parsed.alias, place: result.place }));
+    await ctx.reply(
+      t(locale, 'admin_place_geocoded', {
+        place: result.place,
+        lat: result.lat.toFixed(3),
+        lon: result.lon.toFixed(3),
+      }),
+    );
   }
 
   private async addChannel(ctx: Context, locale: string, raw: string): Promise<void> {
@@ -416,6 +444,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       await ctx.reply(t(user.locale, 'admin_ask_channel'));
     }
     if (data === 'admin_add_place') {
+      this.placeDraft.delete(ctx.from.id);
       this.wait.set(ctx.from.id, 'place');
       await ctx.reply(t(user.locale, 'admin_ask_place'));
     }
@@ -426,6 +455,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       const id = Number(data.slice(6));
       const row = Number.isInteger(id) ? await this.prisma.unknownToponym.findUnique({ where: { id } }) : null;
       this.wait.set(ctx.from.id, 'place');
+      if (row) this.placeDraft.set(ctx.from.id, row.label);
+      else this.placeDraft.delete(ctx.from.id);
       await ctx.reply(row ? t(user.locale, 'admin_ask_place_for', { alias: row.label }) : t(user.locale, 'admin_ask_place'));
     }
     if (data.startsWith('forget:')) {

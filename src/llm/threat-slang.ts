@@ -1,5 +1,6 @@
 import { normalize } from '../common/text';
 import { isContinuation, isEtaOnly, isTrackLost, leftOblast } from '../alerts/message-chain';
+import { isForeignOnlyThreat } from '../geo/place-match';
 
 export type ThreatKind =
   | 'shahed'
@@ -86,6 +87,7 @@ export function enrichThreatType(
 ): { threatType: string; isThreat: boolean; notify: boolean; fromSlang: boolean; trackLost: boolean } {
   const trackLost = isTrackLost(text);
   const left = leftOblast(text);
+  const foreign = isForeignOnlyThreat(text);
   const chained = context.length > 0 || isContinuation(text);
   const combined = [...context, text].join('\n');
   const slang = detectThreatSlang(chained || trackLost ? combined : text);
@@ -96,7 +98,7 @@ export function enrichThreatType(
     return {
       threatType: allClear ? 'all_clear' : type,
       isThreat: !allClear,
-      notify: !left && !isEtaOnly(text),
+      notify: !left && !foreign && !isEtaOnly(text),
       fromSlang: weak,
       trackLost: trackLost || left,
     };
@@ -105,7 +107,7 @@ export function enrichThreatType(
   return {
     threatType: llmType ?? 'other',
     isThreat: allClear ? false : llmIsThreat || trackLost || chained,
-    notify: !left && !isEtaOnly(text) && (allClear || llmIsThreat || trackLost || chained),
+    notify: !left && !foreign && !isEtaOnly(text) && (allClear || llmIsThreat || trackLost || chained),
     fromSlang: false,
     trackLost: trackLost || left,
   };

@@ -35,6 +35,7 @@ export class PipelineService {
   private buffer: BufferedMessage[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private flushing = false;
+  private readonly inFlight = new Set<number>();
   private readonly batchSize: number;
   private readonly waitMs: number;
 
@@ -52,9 +53,16 @@ export class PipelineService {
   }
 
   enqueue(items: BufferedMessage[]): void {
-    this.buffer.push(...items);
+    const queued = new Set(this.buffer.map((item) => item.dbId));
+    const fresh = items.filter((item) => {
+      if (queued.has(item.dbId) || this.inFlight.has(item.dbId)) return false;
+      queued.add(item.dbId);
+      return true;
+    });
+    if (!fresh.length) return;
+    this.buffer.push(...fresh);
     this.metrics.bufferSize = this.buffer.length;
-    this.logger.debug(`enqueue +${items.length} buffer=${this.buffer.length}`);
+    this.logger.debug(`enqueue +${fresh.length} buffer=${this.buffer.length}`);
     if (this.buffer.length >= this.batchSize) {
       void this.flush();
       return;
@@ -77,6 +85,7 @@ export class PipelineService {
 
     this.flushing = true;
     const batch = this.buffer.splice(0, this.batchSize);
+    for (const item of batch) this.inFlight.add(item.dbId);
     this.metrics.bufferSize = this.buffer.length;
     this.logger.log(`flush batch=${batch.length} leftover=${this.buffer.length} channels=${[...new Set(batch.map((b) => b.channel))].join(',')}`);
 
@@ -118,9 +127,9 @@ export class PipelineService {
           analysis.trackLost && chain?.context.length
             ? `${chain.context[chain.context.length - 1]}\n${item.text}`
             : item.text;
-        const places =
+        const resolved =
           analysis.threatType === 'all_clear'
-            ? await this.geo.resolveAndLearn(['Харків'])
+            ? { places: await this.geo.resolveAndLearn(['Харків']), foreign: [] as string[], unknown: [] as string[] }
             : analysis.notify
               ? await this.geo.resolveThreatPlaces({
                   text: placeText,
@@ -128,7 +137,8 @@ export class PipelineService {
                   oblast: analysis.oblast,
                   geoScope: analysis.geoScope,
                 })
-              : [];
+              : { places: [], foreign: [], unknown: [] };
+        const places = resolved.places;
 
         const storedKey =
           places.length > 0
@@ -143,6 +153,7 @@ export class PipelineService {
           `msg ${item.dbId} @${item.channel} threat=${analysis.isThreat} type=${analysis.threatType ?? '-'} ` +
             `lost=${analysis.trackLost} chain=${chain?.context.length ?? 0} ` +
             `places=[${analysis.places.join(', ')}] resolved=[${places.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
+            `foreign=[${resolved.foreign.join(', ')}] unknown=[${resolved.unknown.join(', ')}] ` +
             `key=${storedKey ?? '-'}`,
         );
 
@@ -163,12 +174,16 @@ export class PipelineService {
         }
 
         if (!analysis.notify) continue;
+        if (resolved.foreign.length && places.length === 0) {
+          this.logger.log(`msg ${item.dbId} other city [${resolved.foreign.join(', ')}], skip`);
+          continue;
+        }
         if (places.length === 0) {
           this.logger.warn(`msg ${item.dbId} threat without resolved places, skip alert`);
           void this.telegram.askUnknownToponym({
             channel: item.channel,
             text: item.text,
-            guesses: analysis.places,
+            guesses: analysis.places.length ? analysis.places : resolved.unknown,
           });
           continue;
         }
@@ -218,6 +233,7 @@ export class PipelineService {
       this.buffer.unshift(...batch);
       this.metrics.bufferSize = this.buffer.length;
     } finally {
+      for (const item of batch) this.inFlight.delete(item.dbId);
       this.flushing = false;
       if (this.buffer.length >= this.batchSize) void this.flush();
       else if (this.buffer.length > 0 && !this.flushTimer) {

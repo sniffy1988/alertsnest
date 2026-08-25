@@ -1,4 +1,4 @@
-import { foldUa } from '../geo/place-match';
+import { findOutsideCities, foldUa } from '../geo/place-match';
 
 export type ChainMessage = {
   telegramId: number;
@@ -23,7 +23,11 @@ export function isTrackLost(text: string): boolean {
 
 export function leftOblast(text: string): boolean {
   const n = foldUa(text);
-  return /вилет|вылет/.test(n) && /(з област|с област|в полтав|на полтав|полтавськ|полтавск)/.test(n);
+  if (!/вилет|вылет|покинув област|покинул област|уш[её]л из област/.test(n)) return false;
+  return (
+    /з област|с област|полтав|ки[иеє]в|киев|сум|дн[иі]пр|днепр|запор|черн[иі]г/.test(n) ||
+    findOutsideCities(text).length > 0
+  );
 }
 
 export function isEtaOnly(text: string): boolean {

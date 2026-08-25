@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { KHARKIV_CENTER, type PlaceKind } from './ua-gazetteer';
 import { ToponymService, type MemoryToponym } from './toponym.service';
-import { detectOblastRegion, isVagueOblastName, mentionedIn } from './place-match';
+import { detectOblastRegion, findOutsideCities, isVagueOblastName, mentionedIn } from './place-match';
 
 export type ResolvedPlace = {
   name: string;
@@ -9,6 +9,12 @@ export type ResolvedPlace = {
   lon: number;
   code: string;
   matchType: PlaceKind;
+};
+
+export type ThreatPlaceResolve = {
+  places: ResolvedPlace[];
+  foreign: string[];
+  unknown: string[];
 };
 
 const CITY_RADIUS_KM = 22;
@@ -56,7 +62,7 @@ export class GeoService {
     llmPlaces: string[];
     oblast?: string | null;
     geoScope?: string | null;
-  }): Promise<ResolvedPlace[]> {
+  }): Promise<ThreatPlaceResolve> {
     const region = detectOblastRegion(input.text);
     const fromText = this.toponyms.findInText(input.text);
     const groundedLlm = input.llmPlaces.filter(
@@ -67,23 +73,25 @@ export class GeoService {
       .map((name) => this.toponyms.lookup(name))
       .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name));
 
+    const foreign = findOutsideCities(input.text, input.llmPlaces);
     const names: string[] = [];
-    if (fromText.length) names.push(...fromText.map((p) => p.name));
-    else names.push(...groundedLlm);
+    names.push(...fromText.map((p) => p.name));
     names.push(...lookedUp.map((p) => p.name));
+    names.push(...groundedLlm.filter((name) => !this.toponyms.lookup(name) && !findOutsideCities(name).length));
     if (region) names.unshift(region.name);
     if (input.oblast && !isVagueOblastName(input.oblast) && mentionedIn(input.text, input.oblast)) {
       names.push(input.oblast);
     }
 
     const uniqueNames = [...new Set(names.map((n) => n.trim()).filter((n) => n.length >= 3))];
-    if (uniqueNames.length === 0) return [];
-
     const cityHint = this.toponyms.lookup('Харків');
-    const learned = await this.toponyms.learn(uniqueNames, cityHint);
+    const learned = uniqueNames.length ? await this.toponyms.learn(uniqueNames, cityHint) : [];
     const unique = new Map<number, ResolvedPlace>();
+    const unknown: string[] = [];
     for (const item of learned) {
-      unique.set(item.id, this.toResolved(item));
+      if (item.status === 'local') unique.set(item.place.id, this.toResolved(item.place));
+      else if (item.status === 'foreign') foreign.push(item.label);
+      else unknown.push(item.label);
     }
     if (region && ![...unique.values()].some((p) => p.code === region.code || p.matchType === 'region')) {
       unique.set(-1, {
@@ -103,11 +111,16 @@ export class GeoService {
       const outer = places.filter((p) => p.matchType === 'settlement' || p.matchType === 'region');
       if (outer.length) places = outer;
     }
-    return places;
+    return {
+      places,
+      foreign: [...new Set(foreign)],
+      unknown: [...new Set(unknown)],
+    };
   }
 
   async resolveAndLearn(names: string[], oblast?: string | null): Promise<ResolvedPlace[]> {
-    return this.resolveThreatPlaces({ text: names.join(' '), llmPlaces: names, oblast });
+    const resolved = await this.resolveThreatPlaces({ text: names.join(' '), llmPlaces: names, oblast });
+    return resolved.places;
   }
 
   labelForCode(code: string | null | undefined): string {

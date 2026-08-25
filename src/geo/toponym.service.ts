@@ -10,6 +10,8 @@ import {
   inKharkivOblast,
   looksLikeSettlement,
   namesEqual,
+  nominativeGuesses,
+  OBLAST_BBOX,
   placeStem,
   placeVariants,
   registerPlaceSlang,
@@ -28,6 +30,11 @@ export type MemoryToponym = {
   source: string;
 };
 
+export type LearnResult =
+  | { status: 'local'; place: MemoryToponym }
+  | { status: 'foreign'; label: string }
+  | { status: 'unknown'; label: string };
+
 const OVERPASS_URLS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
@@ -41,11 +48,15 @@ const OVERPASS_QUERY = `
 out center tags;
 `.trim();
 
+type NominatimHit = { lat: string; lon: string; name?: string; display_name?: string };
+
 @Injectable()
 export class ToponymService implements OnModuleInit {
   private readonly logger = new Logger(ToponymService.name);
   private items: MemoryToponym[] = [];
   private byNorm = new Map<string, MemoryToponym>();
+  private lastGeocodeAt = 0;
+  private readonly geocodeCache = new Map<string, { lat: number; lon: number; displayName?: string; inOblast: boolean } | 'miss'>();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -53,6 +64,7 @@ export class ToponymService implements OnModuleInit {
     await this.dropBadLearned();
     await this.ensureSeed();
     await this.refreshMemory();
+    await this.sweepResolvedUnknowns();
     const osmCount = await this.prisma.toponym.count({ where: { source: 'osm' } });
     if (osmCount === 0) {
       try {
@@ -151,30 +163,47 @@ export class ToponymService implements OnModuleInit {
     return [...hits.values()];
   }
 
-  async explain(alias: string, meaning: string): Promise<{ ok: true; place: string } | { ok: false; reason: 'bad' | 'unknown_target' }> {
+  async explain(
+    alias: string,
+    meaning: string,
+  ): Promise<
+    | { ok: true; place: string; lat: number; lon: number; learned: boolean }
+    | { ok: false; reason: 'bad' | 'unknown_target' | 'foreign' }
+  > {
     const rawAlias = alias.trim();
     const rawMeaning = meaning.trim();
     if (rawAlias.length < 2 || rawMeaning.length < 2) return { ok: false, reason: 'bad' };
-    const target = this.lookup(rawMeaning);
-    if (!target) return { ok: false, reason: 'unknown_target' };
+    let target = this.lookup(rawMeaning);
+    let learned = false;
+    if (!target) {
+      const [result] = await this.learn([rawMeaning]);
+      if (result?.status === 'foreign') return { ok: false, reason: 'foreign' };
+      if (result?.status !== 'local') return { ok: false, reason: 'unknown_target' };
+      target = result.place;
+      learned = true;
+    }
     await this.addAlias(target, rawAlias);
+    if (foldUa(rawAlias) !== foldUa(rawMeaning)) await this.addAlias(target, rawMeaning);
     await this.sweepUnknowns(rawAlias);
-    this.logger.log(`taught alias "${rawAlias}" → ${target.name}`);
-    return { ok: true, place: target.name };
+    await this.sweepUnknowns(rawMeaning);
+    this.logger.log(`taught alias "${rawAlias}" → ${target.name}${learned ? ' (geocoded)' : ''}`);
+    return { ok: true, place: target.name, lat: target.lat, lon: target.lon, learned };
   }
 
   async rememberUnknown(input: {
     labels: string[];
     sampleText: string;
     channel: string;
-  }): Promise<{ created: string[] }> {
-    const created: string[] = [];
+  }): Promise<{ created: Array<{ id: number; label: string }> }> {
+    const created: Array<{ id: number; label: string }> = [];
     const labels = input.labels.map((s) => s.trim()).filter((s) => s.length >= 2);
     const toStore = labels.length ? labels : [input.sampleText.slice(0, 48).trim()].filter(Boolean);
+    const seenNorm = new Set<string>();
     for (const label of toStore) {
       if (this.lookup(label)) continue;
-      const norm = foldUa(label);
-      if (!norm || this.lookup(norm)) continue;
+      const norm = this.unknownNorm(label);
+      if (!norm || this.lookup(norm) || seenNorm.has(norm)) continue;
+      seenNorm.add(norm);
       const existing = await this.prisma.unknownToponym.findUnique({ where: { norm } });
       if (existing) {
         await this.prisma.unknownToponym.update({
@@ -188,7 +217,7 @@ export class ToponymService implements OnModuleInit {
         });
         continue;
       }
-      await this.prisma.unknownToponym.create({
+      const row = await this.prisma.unknownToponym.create({
         data: {
           label,
           norm,
@@ -196,7 +225,7 @@ export class ToponymService implements OnModuleInit {
           channel: input.channel,
         },
       });
-      created.push(label);
+      created.push({ id: row.id, label });
     }
     return { created };
   }
@@ -225,11 +254,20 @@ export class ToponymService implements OnModuleInit {
     return res.count > 0;
   }
 
+  private unknownNorm(label: string): string {
+    const stem = placeStem(label);
+    return stem.length >= 4 ? stem : foldUa(label);
+  }
+
   private async sweepUnknowns(alias: string): Promise<void> {
-    const norms = [...new Set([foldUa(alias), normalize(alias)].filter(Boolean))];
+    const norms = [...new Set([this.unknownNorm(alias), foldUa(alias), normalize(alias)].filter(Boolean))];
     if (norms.length) {
       await this.prisma.unknownToponym.deleteMany({ where: { norm: { in: norms } } });
     }
+    await this.sweepResolvedUnknowns();
+  }
+
+  private async sweepResolvedUnknowns(): Promise<void> {
     const leftover = await this.prisma.unknownToponym.findMany();
     for (const row of leftover) {
       if (this.lookup(row.label) || this.lookup(row.norm)) {
@@ -264,8 +302,8 @@ export class ToponymService implements OnModuleInit {
     return [...found.values()];
   }
 
-  async learn(names: string[], hint?: MemoryToponym | null): Promise<MemoryToponym[]> {
-    const resolved: MemoryToponym[] = [];
+  async learn(names: string[], hint?: MemoryToponym | null): Promise<LearnResult[]> {
+    const resolved: LearnResult[] = [];
     for (const raw of names) {
       const name = raw.trim();
       if (name.length < 3) continue;
@@ -273,27 +311,38 @@ export class ToponymService implements OnModuleInit {
       if (existing) {
         await this.touch(existing, name);
         const fresh = this.byNorm.get(existing.norm) ?? existing;
-        resolved.push(fresh);
+        resolved.push({ status: 'local', place: fresh });
         continue;
       }
-      const created = await this.insertLearned(name, hint);
-      if (created) resolved.push(created);
+      resolved.push(await this.insertLearned(name, hint));
     }
     return resolved;
   }
 
-  private async insertLearned(name: string, hint?: MemoryToponym | null): Promise<MemoryToponym | null> {
+  private async insertLearned(name: string, hint?: MemoryToponym | null): Promise<LearnResult> {
     const kind = this.guessKind(name);
     const geo = await this.geocode(name, kind);
     if (!geo) {
       this.logger.log(`Skip learn "${name}" (${kind}): no coordinates`);
-      return null;
+      return { status: 'unknown', label: name };
     }
+    if (!geo.inOblast) {
+      this.logger.log(`Skip learn "${name}": outside oblast ${geo.lat.toFixed(4)},${geo.lon.toFixed(4)}`);
+      return { status: 'foreign', label: geo.displayName ?? name };
+    }
+    const official = geo.displayName?.split(',')[0]?.trim() || name;
+    const aliases = [
+      ...new Set(
+        [normalize(name), foldUa(name), normalize(official), foldUa(official), ...nominativeGuesses(name)].filter(
+          Boolean,
+        ),
+      ),
+    ];
     const row = await this.prisma.toponym.create({
       data: {
-        name,
-        norm: normalize(name),
-        aliases: JSON.stringify([normalize(name), foldUa(name)].filter(Boolean)),
+        name: official,
+        norm: normalize(official),
+        aliases: JSON.stringify(aliases),
         lat: geo.lat,
         lon: geo.lon,
         kind,
@@ -303,8 +352,9 @@ export class ToponymService implements OnModuleInit {
     });
     const mem = this.toMemory(row);
     this.index(mem);
-    this.logger.log(`Learned toponym "${name}" (${kind}) ${geo.lat.toFixed(4)},${geo.lon.toFixed(4)}`);
-    return mem;
+    await this.sweepUnknowns(name);
+    this.logger.log(`Learned toponym "${official}" from "${name}" (${kind}) ${geo.lat.toFixed(4)},${geo.lon.toFixed(4)}`);
+    return { status: 'local', place: mem };
   }
 
   private async touch(item: MemoryToponym, seenAs: string): Promise<void> {
@@ -343,27 +393,102 @@ export class ToponymService implements OnModuleInit {
     if (bad.count) this.logger.log(`Dropped ${bad.count} learned toponyms with guessed coords`);
   }
 
-  private async geocode(name: string, kind: ToponymKind): Promise<{ lat: number; lon: number } | null> {
-    const suffix = kind === 'street' || kind === 'district' ? 'Харків' : 'Харківська область Україна';
-    try {
-      const response = await axios.get<Array<{ lat: string; lon: string }>>(
-        'https://nominatim.openstreetmap.org/search',
-        {
-          timeout: 12_000,
-          params: { q: `${name} ${suffix}`, format: 'json', limit: 1 },
-          headers: { 'User-Agent': 'alertsNest/1.0 (kharkiv-alerts)', Accept: 'application/json' },
-        },
-      );
-      const hit = response.data[0];
-      if (!hit) return null;
-      const lat = Number(hit.lat);
-      const lon = Number(hit.lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-      if (!inKharkivOblast(lat, lon)) return null;
-      if ((kind === 'street' || kind === 'district') && this.haversineKm(lat, lon, KHARKIV_CENTER.lat, KHARKIV_CENTER.lon) > 25) {
-        return null;
+  private async geocode(
+    name: string,
+    kind: ToponymKind,
+  ): Promise<{ lat: number; lon: number; displayName?: string; inOblast: boolean } | null> {
+    const cacheKey = `${kind}:${foldUa(name)}`;
+    const cached = this.geocodeCache.get(cacheKey);
+    if (cached === 'miss') return null;
+    if (cached) return cached;
+
+    const queries = nominativeGuesses(name);
+    let foreign: { lat: number; lon: number; displayName?: string; inOblast: boolean } | null = null;
+
+    for (const query of queries) {
+      const local = await this.nominatimSearch(query, kind, true);
+      if (local) {
+        this.geocodeCache.set(cacheKey, local);
+        return local;
       }
-      return { lat, lon };
+    }
+    for (const query of queries) {
+      const anywhere = await this.nominatimSearch(query, kind, false);
+      if (!anywhere) continue;
+      if (anywhere.inOblast) {
+        this.geocodeCache.set(cacheKey, anywhere);
+        return anywhere;
+      }
+      foreign = anywhere;
+    }
+
+    if (foreign) {
+      this.geocodeCache.set(cacheKey, foreign);
+      return foreign;
+    }
+    this.geocodeCache.set(cacheKey, 'miss');
+    return null;
+  }
+
+  private async nominatimSearch(
+    name: string,
+    kind: ToponymKind,
+    bounded: boolean,
+  ): Promise<{ lat: number; lon: number; displayName?: string; inOblast: boolean } | null> {
+    const wait = 1100 - (Date.now() - this.lastGeocodeAt);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    this.lastGeocodeAt = Date.now();
+
+    const suffix =
+      kind === 'street' || kind === 'district'
+        ? 'Харків Україна'
+        : bounded
+          ? 'Харківська область Україна'
+          : 'Україна';
+    try {
+      const response = await axios.get<NominatimHit[]>('https://nominatim.openstreetmap.org/search', {
+        timeout: 12_000,
+        params: {
+          q: `${name} ${suffix}`,
+          format: 'jsonv2',
+          limit: 5,
+          countrycodes: 'ua',
+          viewbox: `${OBLAST_BBOX.minLon},${OBLAST_BBOX.maxLat},${OBLAST_BBOX.maxLon},${OBLAST_BBOX.minLat}`,
+          bounded: bounded ? 1 : 0,
+          ...(kind === 'settlement' || kind === 'city' ? { featureType: 'settlement' } : {}),
+        },
+        headers: { 'User-Agent': 'alertsNest/1.0 (kharkiv-alerts)', Accept: 'application/json', 'Accept-Language': 'uk' },
+      });
+      const scored = response.data
+        .map((hit) => {
+          const lat = Number(hit.lat);
+          const lon = Number(hit.lon);
+          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+          return {
+            lat,
+            lon,
+            displayName: hit.name || hit.display_name,
+            inOblast: inKharkivOblast(lat, lon),
+            km: this.haversineKm(lat, lon, KHARKIV_CENTER.lat, KHARKIV_CENTER.lon),
+          };
+        })
+        .filter((hit): hit is NonNullable<typeof hit> => hit != null);
+
+      const inOblast = scored.filter((hit) => hit.inOblast);
+      const pool = bounded ? inOblast : scored;
+      if ((kind === 'street' || kind === 'district') && inOblast.length) {
+        const city = inOblast.filter((hit) => hit.km <= 25);
+        if (!city.length) return null;
+        city.sort((a, b) => a.km - b.km);
+        return city[0];
+      }
+      pool.sort((a, b) => {
+        if (a.inOblast !== b.inOblast) return a.inOblast ? -1 : 1;
+        return a.km - b.km;
+      });
+      const best = pool[0];
+      if (!best) return null;
+      return { lat: best.lat, lon: best.lon, displayName: best.displayName, inOblast: best.inOblast };
     } catch (err) {
       this.logger.warn(`Nominatim "${name}": ${err instanceof Error ? err.message : err}`);
       return null;
