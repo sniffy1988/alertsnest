@@ -83,6 +83,23 @@ const SLANG: Array<{ needles: string[]; type: ThreatKind; allClear?: boolean }> 
     type: 'shahed',
   },
   { needles: ['ударний бпла', 'ударный бпла', 'ударний на', 'ударный на'], type: 'strike_uav' },
+  // Generic UAV after specific jet/shahed/strike needles — 0.8b often marks these is_threat=false.
+  {
+    needles: [
+      'бпла',
+      'дрон',
+      'дрони',
+      'дрона',
+      'дрону',
+      'дроном',
+      'беспілот',
+      'беспилот',
+      'невизначеного типу',
+      'неопределенного типа',
+      'неизвестного типа',
+    ],
+    type: 'strike_uav',
+  },
   { needles: ['кинжал', 'кинджал', 'кінжал'], type: 'kinzhal' },
   { needles: ['іскандер-к', 'искандер-к', 'калибр', 'калібр', 'онікс', 'оникс', 'крилата', 'крылата'], type: 'cruise' },
   { needles: ['орешник', 'орешника', 'oreshnik'], type: 'ballistic' },

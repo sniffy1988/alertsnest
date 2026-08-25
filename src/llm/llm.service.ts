@@ -251,6 +251,11 @@ export class LlmService {
           summaryUk: typeof row.summary_uk === 'string' ? row.summary_uk : null,
         });
       }
+      if (byId.size < input.length) {
+        this.logger.warn(
+          `LLM returned ${byId.size}/${input.length} items — slang/gazetteer will fill gaps`,
+        );
+      }
       return input.map((item) => {
         const base = byId.get(item.id) ?? {
           isThreat: false,
