@@ -3,6 +3,7 @@ import { KHARKIV_CENTER, type PlaceKind } from './ua-gazetteer';
 import { ToponymService, type MemoryToponym } from './toponym.service';
 import {
   detectOblastRegion,
+  dropStemSiblings,
   dropStreetShadows,
   findOutsideCities,
   foldUa,
@@ -11,6 +12,7 @@ import {
   isVagueOblastName,
   mentionedIn,
   mentionsAdminRaion,
+  preferRaionOverStemSiblings,
   queryLooksLikeStreet,
 } from './place-match';
 import { isThreatLabel } from '../llm/threat-slang';
@@ -148,6 +150,10 @@ export class GeoService {
 
     let places = dropStreetShadows([...unique.values()], input.text);
     places = this.dropCityAdjectiveStreets(places, input.text);
+    places = preferRaionOverStemSiblings(places, input.text);
+    places = dropStemSiblings(places, input.text);
+    const groundedPlaces = places.filter((p) => mentionedIn(input.text, p.name));
+    if (groundedPlaces.length) places = groundedPlaces;
 
     const cityPlacesInText = fromText.some((p) => p.kind === 'street' || p.kind === 'district');
     const precise = places.filter((p) => p.matchType !== 'city');

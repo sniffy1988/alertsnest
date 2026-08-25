@@ -23,7 +23,16 @@ export function isTrackLost(text: string): boolean {
 
 export function leftOblast(text: string): boolean {
   const n = foldUa(text);
-  if (!/вилет|вылет|покинув област|покинул област|уш[её]л из област/.test(n)) return false;
+  const towardForeign =
+    /(дали|далее|дальше|курс|наступн|потом)\s+(на\s+)?(полтав|ки[иеє]в|киев|сум|дн[иі]пр|днепр|запор|черн[иі]г|донець|луган|б[єе]лгород)/.test(
+      n,
+    ) ||
+    /на\s+(полтавщин|сумщин|ки[иеє]вщин|киевщин|днепропетровщин|черн[иі]г[иі]вщин)/.test(n) ||
+    /курс\s+на\s+(полтав|ки[иеє]в|киев|сум)/.test(n);
+  if (towardForeign) return true;
+  if (!/вилет|вылет|покинув област|покинул област|уш[её]л из област|в\s+полтавськ|в\s+полтавск/.test(n)) {
+    return findOutsideCities(text).length > 0 && !/харк|харьков|kharkiv/.test(n);
+  }
   return (
     /з област|с област|полтав|ки[иеє]в|киев|сум|дн[иі]пр|днепр|запор|черн[иі]г/.test(n) ||
     findOutsideCities(text).length > 0

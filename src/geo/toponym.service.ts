@@ -25,6 +25,7 @@ import {
   placeVariants,
   queryLooksLikeStreet,
   registerPlaceSlang,
+  tokenRefersToName,
 } from './place-match';
 import { isThreatLabel } from '../llm/threat-slang';
 
@@ -142,31 +143,38 @@ export class ToponymService implements OnModuleInit {
     const queryStem = placeStem(raw);
     if (queryStem.length < 5) return null;
 
-    const wantStreet = queryLooksLikeStreet(raw);
-    let best: MemoryToponym | null = null;
-    let bestScore = -1;
-    for (const item of this.items) {
-      const labels = [item.name, item.norm, ...item.aliases];
-      for (const label of labels) {
-        if (!namesEqual(raw, label)) continue;
-        const exact = foldUa(label) === foldUa(raw);
-        const kindBoost = wantStreet
-          ? item.kind === 'street'
-            ? 4
-            : 0
-          : item.kind === 'settlement' || item.kind === 'region'
-            ? 4
-            : item.kind === 'street'
-              ? 0
-              : 1;
-        const score = (exact ? 80 : 0) + kindBoost + Math.min(foldUa(label).length, 30) / 100;
-        if (score > bestScore) {
-          best = item;
-          bestScore = score;
+        const wantStreet = queryLooksLikeStreet(raw);
+        const wantCity = /^(харків|харьков|kharkiv|kharkov)$/.test(foldUa(raw));
+        let best: MemoryToponym | null = null;
+        let bestScore = -1;
+        for (const item of this.items) {
+          if (wantCity && item.kind !== 'city') continue;
+          const labels = [item.name, item.norm, ...item.aliases];
+          for (const label of labels) {
+            const exactFold = foldUa(label) === foldUa(raw);
+            const refers = tokenRefersToName(raw, label) || tokenRefersToName(raw, item.name);
+            if (!exactFold && !refers) continue;
+            const kindBoost = wantStreet
+              ? item.kind === 'street'
+                ? 4
+                : 0
+              : wantCity
+                ? item.kind === 'city'
+                  ? 8
+                  : 0
+                : item.kind === 'settlement' || item.kind === 'region'
+                  ? 4
+                  : item.kind === 'street'
+                    ? 0
+                    : 1;
+            const score = (exactFold ? 100 : 50) + kindBoost + Math.min(foldUa(label).length, 30) / 100;
+            if (score > bestScore) {
+              best = item;
+              bestScore = score;
+            }
+          }
         }
-      }
-    }
-    return best;
+        return best;
   }
 
   findInText(text: string): MemoryToponym[] {
@@ -197,14 +205,17 @@ export class ToponymService implements OnModuleInit {
         const stem = placeStem(label);
         if (stem.length < 4) continue;
         const ok = tokens.some((token) => {
-          if (item.kind === 'city') {
-            return /^(харків|харьков|kharkiv|kharkov|харкову|харькову|харкова|харькова|харкові)$/.test(
-              foldUa(token),
-            );
+          const ft = foldUa(token);
+          // Bare "Харків" must not stem-match Харківський район / Харківська вулиця.
+          if (
+            /^(харків|харьков|kharkiv|kharkov|харкову|харькову|харкова|харькова|харкові|харькове)$/.test(ft)
+          ) {
+            return item.kind === 'city';
           }
-          if (namesEqual(token, label)) return true;
-          const tokenStem = placeStem(token);
-          return tokenStem.length >= 4 && tokenStem === stem;
+          if (item.kind === 'city') {
+            return false;
+          }
+          return tokenRefersToName(token, label) || tokenRefersToName(token, item.name);
         });
         if (!ok) continue;
         scored.push({ item, len: foldUa(label).length });

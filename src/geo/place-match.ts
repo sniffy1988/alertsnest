@@ -101,16 +101,36 @@ export function mentionedIn(text: string, name: string): boolean {
     if (phrase.length >= 2 && (padded.includes(` ${phrase} `) || paddedExpanded.includes(` ${phrase} `))) return true;
   }
 
-  const stem = placeStem(name);
-  if (stem.length < 4) {
-    return new RegExp(`(?:^| )${escapeRe(foldedName)}(?: |$)`).test(padded);
-  }
   const tokens = foldedText.split(' ').filter(Boolean);
-  return tokens.some((token) => {
-    if (token === foldedName || token === stem) return true;
-    const tokenStem = placeStem(token);
-    return tokenStem.length >= 4 && tokenStem === stem;
-  });
+  return tokens.some((token) => tokenRefersToName(token, name));
+}
+
+/**
+ * Strict token↔name link: lemma / declined forms / «лозівський»→«Лозівський район».
+ * Does NOT equate stem-siblings (Лозова ≠ Лозове).
+ */
+export function tokenRefersToName(token: string, name: string): boolean {
+  const ft = foldUa(token);
+  const fl = foldUa(name);
+  if (!ft || !fl) return false;
+  if (ft === fl) return true;
+  if (nominativeGuesses(token).some((g) => foldUa(g) === fl)) return true;
+  if (nominativeGuesses(name).some((g) => foldUa(g) === ft)) return true;
+  for (const variant of placeVariants(name)) {
+    if (foldUa(variant) === ft) return true;
+    if (nominativeGuesses(token).some((g) => foldUa(g) === foldUa(variant))) return true;
+  }
+  if (/\s+район$/.test(fl)) {
+    const head = fl.replace(/\s+район$/, '');
+    if (ft === head) return true;
+    if (
+      /(ський|ский|ська|ская|ське|ское|ській|ской)$/.test(ft) &&
+      placeStem(ft) === placeStem(head)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function inKharkivOblast(lat: number, lon: number): boolean {
@@ -183,10 +203,70 @@ export function dropStreetShadows<T extends { name: string; kind?: PlaceKind; ma
   if (!outerStems.size) return items;
   return items.filter((item) => {
     if (kindOf(item) !== 'street') return true;
-    const stem = placeStem(item.name);
-    if (!outerStems.has(stem)) return true;
+    const stem = streetHeadStem(item.name);
+    if (!outerStems.has(stem) && !outerStems.has(placeStem(item.name))) return true;
     return streetFormInText(text, item.name);
   });
+}
+
+function streetHeadStem(streetName: string): string {
+  const head =
+    foldUa(streetName)
+      .replace(/^(вул|улица|просп|пр|майдан)\s+/, '')
+      .split(/\s+/)[0] ?? '';
+  return placeStem(head);
+}
+
+/** When «X район» is in text, keep that region — drop stem-sibling settlements/streets. */
+export function preferRaionOverStemSiblings<T extends { name: string; kind?: PlaceKind; matchType?: PlaceKind }>(
+  items: T[],
+  text: string,
+): T[] {
+  if (!mentionsAdminRaion(text)) return items;
+  const kindOf = (item: T) => item.kind ?? item.matchType;
+  const raions = items.filter((item) => kindOf(item) === 'region' && /район/i.test(item.name));
+  if (!raions.length) return items;
+  const mentioned = raions.filter((item) => mentionedIn(text, item.name));
+  const keep = mentioned.length ? mentioned : raions;
+  return keep;
+}
+
+/** Among stem-siblings, keep only items that the text actually refers to. */
+export function dropStemSiblings<T extends { name: string; kind?: PlaceKind; matchType?: PlaceKind }>(
+  items: T[],
+  text: string,
+): T[] {
+  if (items.length < 2) return items;
+  const kindOf = (item: T) => item.kind ?? item.matchType;
+  const byStem = new Map<string, T[]>();
+  for (const item of items) {
+    const stem = placeStem(item.name);
+    if (stem.length < 4) continue;
+    const list = byStem.get(stem) ?? [];
+    list.push(item);
+    byStem.set(stem, list);
+  }
+  const drop = new Set<T>();
+  for (const group of byStem.values()) {
+    if (group.length < 2) continue;
+    const referred = group.filter((item) => mentionedIn(text, item.name));
+    const winners = referred.length ? referred : group;
+    // Prefer region > settlement > district > street when several still match
+    const rank = (item: T) => {
+      const k = kindOf(item);
+      if (k === 'region') return 4;
+      if (k === 'settlement') return 3;
+      if (k === 'district') return 2;
+      if (k === 'city') return 1;
+      return 0;
+    };
+    const bestRank = Math.max(...winners.map(rank));
+    const best = winners.filter((item) => rank(item) === bestRank);
+    for (const item of group) {
+      if (!best.includes(item)) drop.add(item);
+    }
+  }
+  return items.filter((item) => !drop.has(item));
 }
 
 function streetFormInText(text: string, streetName: string): boolean {
@@ -245,6 +325,7 @@ export function isPlausiblePlaceLabel(name: string): boolean {
   const raw = name.trim();
   if (raw.length < 3 || raw.length > 64) return false;
   if (isVagueOblastName(raw)) return false;
+  if (isForeignOblastLabel(raw)) return false;
   const n = foldUa(raw);
   if (!n) return false;
   if (!/[а-яa-z]/i.test(n)) return false;
@@ -254,9 +335,12 @@ export function isPlausiblePlaceLabel(name: string): boolean {
 
 /** Cities / oblasts that air channels mention but we do not alert on. */
 const OUTSIDE_CITY_RE: Array<{ name: string; re: RegExp }> = [
-  { name: 'Київ', re: /(?:^|\s)(ки[иеє]в|киев|kyiv|kiev)(?!ськ|ск)(?:а|у|е|і|ом)?(?:\s|$)/ },
+  { name: 'Київ', re: /(?:^|\s)(ки[иеє]в|киев|kyiv|kiev)(?!ськ|ск|щин)(?:а|у|е|і|ом)?(?:\s|$)/ },
   { name: 'Полтава', re: /(?:^|\s)полтав(?:а|у|и|і|е|ой)?(?:\s|$)/ },
+  { name: 'Полтавська область', re: /(?:^|\s)полтав(?:ськ[а-я]*\s+област|ск[а-я]*\s+област|щин[а-я]*)/ },
   { name: 'Суми', re: /(?:^|\s)(суми|сумы|сум[уиы])(?:\s|$)/ },
+  { name: 'Сумська область', re: /(?:^|\s)сум(?:ськ[а-я]*\s+област|ск[а-я]*\s+област|щин[а-я]*)/ },
+  { name: 'Київська область', re: /(?:^|\s)(ки[иеє]вщин[а-я]*|киевщин[а-я]*|ки[иеє]вськ[а-я]*\s+област|киевск[а-я]*\s+област)/ },
   { name: 'Дніпро', re: /(?:^|\s)(дн[иі]про|днепр)(?:а|у|е|о)?(?:\s|$)/ },
   { name: 'Чернігів', re: /(?:^|\s)черн[иі]г[иі]в(?:а|у|е|і)?(?:\s|$)/ },
   { name: 'Запоріжжя', re: /(?:^|\s)запор[иі]ж(?:жя|ье|жя|жжя)?(?:\s|$)/ },
@@ -274,34 +358,37 @@ const OUTSIDE_CITY_RE: Array<{ name: string; re: RegExp }> = [
 
 function stripKharkivFalseFriends(folded: string): string {
   return folded
-    .replace(/ки[иеє]вськ\w*\s+район/g, ' ')
-    .replace(/киевск\w*\s+район/g, ' ')
-    .replace(/полтавськ\w*\s+шлях/g, ' ')
-    .replace(/полтавск\w*\s+шлях/g, ' ')
-    .replace(/сумськ\w*\s+вул/g, ' ')
+    .replace(/ки[иеє]вськ[а-я]*\s+район/g, ' ')
+    .replace(/киевск[а-я]*\s+район/g, ' ')
+    .replace(/полтавськ[а-я]*\s+шлях/g, ' ')
+    .replace(/полтавск[а-я]*\s+шлях/g, ' ')
+    .replace(/сумськ[а-я]*\s+вул/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+export function isForeignOblastLabel(name: string): boolean {
+  const n = foldUa(name);
+  if (!n) return false;
+  if (/^харк|^харьков/.test(n)) return false;
+  return (
+    /^(полтав|сум|ки[иеє]в|киев|дн[иі]про|днепр|запор|черн[иі]г|донець|луган|одес|микола|херсон|черкас|житомир|в[иі]нниц|б[єе]лгород)/.test(
+      n,
+    ) && /(област|щин|ська|ская|ский|ський)/.test(n)
+  );
 }
 
 export function findOutsideCities(text: string, extra: string[] = []): string[] {
   const n = stripKharkivFalseFriends(foldUa([text, ...extra].filter(Boolean).join(' ')));
   if (!n) return [];
-  if (
-    /полтавськ\w*\s+област|полтавск\w*\s+област|ки[иеє]вськ\w*\s+област|киевск\w*\s+област|сумськ\w*\s+област|сумск\w*\s+област/.test(
-      n,
-    )
-  ) {
-    const oblast: string[] = [];
-    if (/полтавськ|полтавск/.test(n)) oblast.push('Полтавська область');
-    if (/ки[иеє]вськ|киевск/.test(n)) oblast.push('Київська область');
-    if (/сумськ|сумск/.test(n)) oblast.push('Сумська область');
-    return [...new Set(oblast)];
-  }
   const hits: string[] = [];
   for (const row of OUTSIDE_CITY_RE) {
     if (row.re.test(n)) hits.push(row.name);
   }
-  return hits;
+  for (const label of extra) {
+    if (isForeignOblastLabel(label)) hits.push(label.trim());
+  }
+  return [...new Set(hits)];
 }
 
 export function hasKharkivLocalCue(text: string): boolean {

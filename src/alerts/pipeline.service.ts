@@ -132,7 +132,12 @@ export class PipelineService {
             : item.text;
         const resolved =
           analysis.threatType === 'all_clear'
-            ? { places: await this.geo.resolveAndLearn(['Харків']), foreign: [] as string[], unknown: [] as string[] }
+            ? await this.geo.resolveThreatPlaces({
+                text: item.text,
+                llmPlaces: analysis.places.length ? analysis.places : ['Харків'],
+                oblast: analysis.oblast,
+                geoScope: analysis.geoScope ?? 'city',
+              })
             : analysis.notify
               ? await this.geo.resolveThreatPlaces({
                   text: placeText,
@@ -140,7 +145,30 @@ export class PipelineService {
                   oblast: analysis.oblast,
                   geoScope: analysis.geoScope,
                 })
-              : { places: [], foreign: [], unknown: [] };
+              : { places: [], foreign: [] as string[], unknown: [] as string[] };
+        // all_clear with no local hit → city Kharkiv only (never «Харківська вулиця»)
+        if (analysis.threatType === 'all_clear' && !resolved.places.some((p) => p.matchType === 'city')) {
+          const city = this.geo.findPlace('Харків');
+          if (city && !resolved.places.length) {
+            resolved.places.push({
+              name: city.name,
+              lat: city.lat,
+              lon: city.lon,
+              code: city.norm,
+              matchType: city.kind,
+            });
+          } else if (city && resolved.places.every((p) => p.matchType === 'street')) {
+            resolved.places = [
+              {
+                name: city.name,
+                lat: city.lat,
+                lon: city.lon,
+                code: city.norm,
+                matchType: city.kind,
+              },
+            ];
+          }
+        }
         const places = [...resolved.places];
 
         const storedKey =
