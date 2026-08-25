@@ -11,6 +11,7 @@ import {
 } from './geocode-rank';
 import {
   dropStreetShadows,
+  expandAliases,
   expandPlaceSlang,
   foldPlaceText,
   foldUa,
@@ -21,6 +22,7 @@ import {
   namesEqual,
   nominativeGuesses,
   OBLAST_BBOX,
+  placeForms,
   placeStem,
   placeVariants,
   queryLooksLikeStreet,
@@ -126,12 +128,24 @@ export class ToponymService implements OnModuleInit {
     return this.items;
   }
 
-  lookup(raw: string): MemoryToponym | null {
+  lookup(raw: string, preferredKind?: ToponymKind | null): MemoryToponym | null {
     const key = normalize(raw);
     if (!key) return null;
     for (const variant of placeVariants(raw)) {
       const exact = this.byNorm.get(variant) ?? this.byNorm.get(normalize(variant)) ?? this.byNorm.get(foldUa(variant));
       if (!exact) continue;
+      if (preferredKind) {
+        const sameKind = this.items.find(
+          (item) =>
+            item.kind === preferredKind &&
+            (namesEqual(raw, item.name) ||
+              namesEqual(raw, item.norm) ||
+              item.aliases.some((a) => namesEqual(raw, a))),
+        );
+        if (sameKind) return sameKind;
+        if (exact.kind === preferredKind) return exact;
+        continue;
+      }
       if (exact.kind !== 'street' || queryLooksLikeStreet(raw)) return exact;
       const outer = this.items.find(
         (item) =>
@@ -143,18 +157,25 @@ export class ToponymService implements OnModuleInit {
     const queryStem = placeStem(raw);
     if (queryStem.length < 5) return null;
 
-        const wantStreet = queryLooksLikeStreet(raw);
-        const wantCity = /^(харків|харьков|kharkiv|kharkov)$/.test(foldUa(raw));
-        let best: MemoryToponym | null = null;
-        let bestScore = -1;
-        for (const item of this.items) {
-          if (wantCity && item.kind !== 'city') continue;
-          const labels = [item.name, item.norm, ...item.aliases];
-          for (const label of labels) {
-            const exactFold = foldUa(label) === foldUa(raw);
-            const refers = tokenRefersToName(raw, label) || tokenRefersToName(raw, item.name);
-            if (!exactFold && !refers) continue;
-            const kindBoost = wantStreet
+    const scored = (wantKind: ToponymKind | null | undefined): MemoryToponym | null => {
+      const wantStreet = wantKind === 'street' || queryLooksLikeStreet(raw);
+      const wantCity =
+        wantKind === 'city' || /^(харків|харьков|kharkiv|kharkov)$/.test(foldUa(raw));
+      let best: MemoryToponym | null = null;
+      let bestScore = -1;
+      for (const item of this.items) {
+        if (wantKind && item.kind !== wantKind) continue;
+        if (wantCity && item.kind !== 'city') continue;
+        const labels = [item.name, item.norm, ...item.aliases];
+        for (const label of labels) {
+          const exactFold = foldUa(label) === foldUa(raw);
+          const refers = tokenRefersToName(raw, label) || tokenRefersToName(raw, item.name);
+          if (!exactFold && !refers) continue;
+          const kindBoost = wantKind
+            ? item.kind === wantKind
+              ? 8
+              : 0
+            : wantStreet
               ? item.kind === 'street'
                 ? 4
                 : 0
@@ -167,14 +188,17 @@ export class ToponymService implements OnModuleInit {
                   : item.kind === 'street'
                     ? 0
                     : 1;
-            const score = (exactFold ? 100 : 50) + kindBoost + Math.min(foldUa(label).length, 30) / 100;
-            if (score > bestScore) {
-              best = item;
-              bestScore = score;
-            }
+          const score = (exactFold ? 100 : 50) + kindBoost + Math.min(foldUa(label).length, 30) / 100;
+          if (score > bestScore) {
+            best = item;
+            bestScore = score;
           }
         }
-        return best;
+      }
+      return best;
+    };
+
+    return scored(preferredKind) ?? (preferredKind ? scored(null) : null);
   }
 
   findInText(text: string): MemoryToponym[] {
@@ -352,7 +376,7 @@ export class ToponymService implements OnModuleInit {
   }
 
   private async addAlias(item: MemoryToponym, seenAs: string): Promise<void> {
-    const extras = [...new Set([normalize(seenAs), foldUa(seenAs), seenAs.trim().toLowerCase()].filter(Boolean))];
+    const extras = expandAliases(seenAs, [normalize(seenAs), foldUa(seenAs), seenAs.trim().toLowerCase()], 24);
     const aliases = new Set(item.aliases);
     for (const extra of extras) aliases.add(extra);
     item.aliases = [...aliases];
@@ -380,6 +404,7 @@ export class ToponymService implements OnModuleInit {
   async learn(
     names: string[],
     hint?: MemoryToponym | GeocodeHint | null,
+    preferredKind?: ToponymKind | null,
   ): Promise<LearnResult[]> {
     const resolved: LearnResult[] = [];
     const focus = this.toHint(hint);
@@ -390,14 +415,14 @@ export class ToponymService implements OnModuleInit {
         this.logger.log(`Skip learn "${name}": not a place label`);
         continue;
       }
-      const existing = this.lookup(name);
+      const existing = this.lookup(name, preferredKind);
       if (existing) {
         await this.touch(existing, name);
         const fresh = this.byNorm.get(existing.norm) ?? existing;
         resolved.push({ status: 'local', place: fresh });
         continue;
       }
-      resolved.push(await this.insertLearned(name, focus));
+      resolved.push(await this.insertLearned(name, focus, preferredKind));
     }
     return resolved;
   }
@@ -408,8 +433,12 @@ export class ToponymService implements OnModuleInit {
     return { lat: hint.lat, lon: hint.lon };
   }
 
-  private async insertLearned(name: string, hint?: GeocodeHint | null): Promise<LearnResult> {
-    const guessedKind = this.guessKind(name);
+  private async insertLearned(
+    name: string,
+    hint?: GeocodeHint | null,
+    preferredKind?: ToponymKind | null,
+  ): Promise<LearnResult> {
+    const guessedKind = preferredKind ?? this.guessKind(name);
     const geo = await this.geocode(name, guessedKind, hint);
     if (!geo) {
       this.logger.log(`Skip learn "${name}" (${guessedKind}): no coordinates`);
@@ -419,15 +448,9 @@ export class ToponymService implements OnModuleInit {
       this.logger.log(`Skip learn "${name}": outside oblast ${geo.lat.toFixed(4)},${geo.lon.toFixed(4)}`);
       return { status: 'foreign', label: geo.displayName ?? name };
     }
-    const kind = geo.kind || guessedKind;
+    const kind = preferredKind ?? geo.kind ?? guessedKind;
     const official = geo.displayName?.split(',')[0]?.trim() || name;
-    const aliases = [
-      ...new Set(
-        [normalize(name), foldUa(name), normalize(official), foldUa(official), ...nominativeGuesses(name)].filter(
-          Boolean,
-        ),
-      ),
-    ];
+    const aliases = expandAliases(official, [normalize(name), foldUa(name), normalize(official)], 48);
     const row = await this.prisma.toponym.create({
       data: {
         name: official,
@@ -712,11 +735,11 @@ export class ToponymService implements OnModuleInit {
 
   private async ensureSeed(): Promise<void> {
     for (const place of GAZETTEER) {
-      const aliases = [...new Set([normalize(place.name), ...place.aliases.map(normalize)])];
-      const norm = aliases[0];
+      const aliases = expandAliases(place.name, [normalize(place.name), ...place.aliases.map(normalize)], 48);
+      const norm = normalize(place.name);
       const existing = await this.prisma.toponym.findUnique({ where: { norm } });
       if (existing) {
-        const merged = [...new Set([...this.parseAliases(existing.aliases), ...aliases])];
+        const merged = expandAliases(place.name, [...this.parseAliases(existing.aliases), ...aliases], 64);
         await this.prisma.toponym.update({
           where: { id: existing.id },
           data: { aliases: JSON.stringify(merged), lat: place.lat, lon: place.lon, kind: place.kind },
@@ -933,11 +956,18 @@ export class ToponymService implements OnModuleInit {
     this.byNorm.set(item.norm, item);
     const folded = foldUa(item.norm);
     if (folded) this.byNorm.set(folded, item);
+    const forms = placeForms(item.name);
+    for (const form of forms) {
+      if (!this.byNorm.has(form)) this.byNorm.set(form, item);
+    }
     for (const alias of item.aliases) {
       if (alias) {
         this.byNorm.set(alias, item);
         const foldAlias = foldUa(alias);
         if (foldAlias) this.byNorm.set(foldAlias, item);
+        for (const form of placeForms(alias).slice(0, 12)) {
+          if (!this.byNorm.has(form)) this.byNorm.set(form, item);
+        }
         registerPlaceSlang(alias, item.name);
       }
     }

@@ -17,6 +17,7 @@ export type AlertPayload = {
   summary: string | null;
   eventKey: string;
   threatType: string | null;
+  weaponRaw?: string | null;
   trackLost?: boolean;
   places: ResolvedPlace[];
 };
@@ -42,7 +43,6 @@ export class AlertsService {
       where: {
         isBanned: false,
         silentMode: false,
-        NOT: { oblastCode: 'outside' },
       },
     });
 
@@ -71,6 +71,16 @@ export class AlertsService {
       `dispatch key=${payload.eventKey} places=[${payload.places.map((p) => p.name).join(', ')}] ` +
         `users=${users.length} matched=${targets.length} dedup=${alreadyIds.size}`,
     );
+    if (!targets.length && users.length && payload.places.length) {
+      const sample = users.slice(0, 4).map((user) => {
+        const match = this.geo.matchUser(user, payload.places, {
+          cityWide: payload.threatType === 'all_clear',
+        });
+        const km = match.km != null ? match.km.toFixed(0) : '-';
+        return `u${user.id} ${km}/${match.radiusKm ?? this.geo.userRadiusKm(user.radiusKm)}км`;
+      });
+      this.logger.log(`no match (km/radius): ${sample.join(', ')}`);
+    }
     if (!targets.length) return;
 
     let i = 0;
@@ -124,7 +134,8 @@ export class AlertsService {
     const place = match.place?.name ?? payload.places[0]?.name ?? 'Харків';
     const km =
       match.km != null ? t(loc, 'alert_distance', { km: String(Math.max(1, Math.round(match.km))) }) : '';
-    const kind = threatLabel(payload.threatType, loc);
+    const kind =
+      payload.weaponRaw?.trim() || threatLabel(payload.threatType, loc);
     const titleKey =
       payload.threatType === 'all_clear'
         ? 'alert_clear_title'

@@ -1,6 +1,5 @@
 import { normalize } from '../common/text';
 import { isAllClearPost, isContinuation, isEtaOnly, isTrackLost, leftOblast } from '../alerts/message-chain';
-import { isForeignOnlyThreat } from '../geo/place-match';
 
 export type ThreatKind =
   | 'shahed'
@@ -45,8 +44,25 @@ export const THREAT_LABELS: Record<ThreatKind, { ua: string; ru: string; en: str
 
 const SLANG: Array<{ needles: string[]; type: ThreatKind; allClear?: boolean }> = [
   { needles: ['відбій', 'отбой', 'укриття знято', 'укрытие снято', 'все чисто', 'усе чисто', 'повітря чисто', 'воздух чисто'], type: 'all_clear', allClear: true },
-  { needles: ['шахед', 'шахеды', 'шахеді', 'мопед', 'мопеди', 'герань', 'geran', 'бпла-камікадзе', 'бандерол', 'блядерол'], type: 'shahed' },
-  { needles: ['реактивний бпла', 'реактивный бпла', 'реактивн. бпла', 'реактивні бпла', 'реактивных бпла', 'швидкісн', 'скоростн'], type: 'jet_uav' },
+  {
+    needles: [
+      'реактивний бпла',
+      'реактивный бпла',
+      'реактивн. бпла',
+      'реактивні бпла',
+      'реактивных бпла',
+      'швидкісн',
+      'скоростн',
+      'р. шах',
+      'р шах',
+      'р.шах',
+      'р. шаболд',
+      'р шаболд',
+      'р.шаболд',
+    ],
+    type: 'jet_uav',
+  },
+  { needles: ['шахед', 'шахеды', 'шахеді', 'шаболд', 'мопед', 'мопеди', 'герань', 'geran', 'бпла-камікадзе', 'бандерол', 'блядерол'], type: 'shahed' },
   { needles: ['ударний бпла', 'ударный бпла', 'ударний на', 'ударный на'], type: 'strike_uav' },
   { needles: ['кинжал', 'кинджал', 'кінжал'], type: 'kinzhal' },
   { needles: ['іскандер-к', 'искандер-к', 'калибр', 'калібр', 'онікс', 'оникс', 'крилата', 'крылата'], type: 'cruise' },
@@ -97,7 +113,7 @@ export function isThreatLabel(name: string): boolean {
     .trim();
   if (!n || n.length < 3) return true;
   if (
-    /^(балист\w*|баллист\w*|шахед\w*|мопед\w*|геран\w*|кинжал\w*|кинджал\w*|орешник\w*|калибр\w*|калібр\w*|іскандер\w*|искандер\w*|ракет\w*|каб\w*|фаб\w*|умпк|бпла\w*|ппо|пво|тривог\w*|тревог\w*|загроз\w*|угроз\w*|повітря|воздух|приліт\w*|прилет\w*|вибух\w*|взрыв\w*|бандерол\w*|oreshnik|shahed|kinzhal|iskander)$/.test(
+    /^(балист\w*|баллист\w*|шахед\w*|шаболд\w*|мопед\w*|геран\w*|кинжал\w*|кинджал\w*|орешник\w*|калибр\w*|калібр\w*|іскандер\w*|искандер\w*|ракет\w*|каб\w*|фаб\w*|умпк|бпла\w*|ппо|пво|тривог\w*|тревог\w*|загроз\w*|угроз\w*|повітря|воздух|приліт\w*|прилет\w*|вибух\w*|взрыв\w*|бандерол\w*|oreshnik|shahed|kinzhal|iskander)$/.test(
       n,
     )
   ) {
@@ -122,21 +138,21 @@ export function enrichThreatType(
 ): { threatType: string; isThreat: boolean; notify: boolean; fromSlang: boolean; trackLost: boolean } {
   const trackLost = isTrackLost(text);
   const left = leftOblast(text);
-  const foreign = isForeignOnlyThreat(text);
   const chained = context.length > 0 || isContinuation(text);
   const combined = [...context, text].join('\n');
   const slang = detectThreatSlang(chained || trackLost ? combined : text);
   const textAllClear = isAllClearPost(text) || isAllClearPost(combined);
   const weak = !llmType || llmType === 'other' || llmType === 'all_clear' || llmType === 'none';
+  // local vs foreign is decided later by geocode + distance, not by slang regex
   if (slang) {
     const type = weak ? slang.type : llmType;
     const allClear = !trackLost && !left && (slang.allClear || textAllClear);
     return {
       threatType: allClear ? 'all_clear' : type,
       isThreat: !allClear,
-      notify: !left && !foreign && !isEtaOnly(text),
+      notify: !isEtaOnly(text),
       fromSlang: weak,
-      trackLost: trackLost || left,
+      trackLost,
     };
   }
   const allClear = !trackLost && !left && textAllClear;
@@ -144,8 +160,8 @@ export function enrichThreatType(
   return {
     threatType: allClear ? 'all_clear' : empty ? 'none' : (llmType && llmType !== 'all_clear' ? llmType : 'other'),
     isThreat: allClear ? false : llmIsThreat || trackLost || chained,
-    notify: !left && !foreign && !isEtaOnly(text) && (allClear || llmIsThreat || trackLost || chained),
+    notify: !isEtaOnly(text) && (allClear || llmIsThreat || trackLost || chained),
     fromSlang: false,
-    trackLost: trackLost || left,
+    trackLost,
   };
 }

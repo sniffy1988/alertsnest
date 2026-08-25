@@ -1,8 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
-import { LlmService } from '../llm/llm.service';
-import { GeoService } from '../geo/geo.service';
+import { LlmService, type LlmEvent, type LlmResultItem } from '../llm/llm.service';
+import { GeoService, type ResolvedPlace } from '../geo/geo.service';
 import { AlertsService } from './alerts.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { MetricsService } from '../metrics/metrics.service';
@@ -16,8 +16,9 @@ import {
   type ChainMessage,
 } from './message-chain';
 import { ALERT_DEDUP_MS, canonicalEventKey, eventKeysOverlap } from './event-key';
-import { isCityWideKharkivCue, isPlausiblePlaceLabel } from '../geo/place-match';
+import { isPlausiblePlaceLabel } from '../geo/place-match';
 import { isThreatLabel } from '../llm/threat-slang';
+import type { PlaceKind } from '../geo/ua-gazetteer';
 
 export type BufferedMessage = {
   dbId: number;
@@ -116,7 +117,7 @@ export class PipelineService {
 
         const chain = chains.get(item.dbId);
         if (isNoisePost(item.text)) {
-          await this.persistAnalysis(item.dbId, analysis, analysis.eventKey);
+          await this.persistAnalysis(item.dbId, analysis, null);
           this.logger.debug(`msg ${item.dbId} noise/donate, skip`);
           continue;
         }
@@ -124,159 +125,142 @@ export class PipelineService {
           this.logger.log(`msg ${item.dbId} ETA only, no push`);
         }
         if (leftOblast(item.text)) {
-          this.logger.log(`msg ${item.dbId} left oblast, no city push`);
+          this.logger.log(`msg ${item.dbId} left-oblast cue — classify by coordinates`);
         }
+
         const placeText =
           analysis.trackLost && chain?.context.length
             ? `${chain.context[chain.context.length - 1]}\n${item.text}`
             : item.text;
-        const resolved =
-          analysis.threatType === 'all_clear'
-            ? await this.geo.resolveThreatPlaces({
-                text: item.text,
-                llmPlaces: analysis.places.length ? analysis.places : ['Харків'],
-                oblast: analysis.oblast,
-                geoScope: analysis.geoScope ?? 'city',
-              })
-            : analysis.notify
-              ? await this.geo.resolveThreatPlaces({
-                  text: placeText,
-                  llmPlaces: analysis.places,
-                  oblast: analysis.oblast,
-                  geoScope: analysis.geoScope,
-                })
-              : { places: [], foreign: [] as string[], unknown: [] as string[] };
-        // all_clear with no local hit → city Kharkiv only (never «Харківська вулиця»)
-        if (analysis.threatType === 'all_clear' && !resolved.places.some((p) => p.matchType === 'city')) {
-          const city = this.geo.findPlace('Харків');
-          if (city && !resolved.places.length) {
-            resolved.places.push({
-              name: city.name,
-              lat: city.lat,
-              lon: city.lon,
-              code: city.norm,
-              matchType: city.kind,
-            });
-          } else if (city && resolved.places.every((p) => p.matchType === 'street')) {
-            resolved.places = [
-              {
-                name: city.name,
-                lat: city.lat,
-                lon: city.lon,
-                code: city.norm,
-                matchType: city.kind,
-              },
-            ];
-          }
-        }
-        const places = [...resolved.places];
 
-        const storedKey =
-          places.length > 0
-            ? canonicalEventKey({
-                threatType: analysis.threatType,
-                places,
-                trackLost: analysis.trackLost,
-              })
-            : analysis.eventKey;
+        const events = this.eventsForGeo(analysis);
+        const storedPlaces: Array<{
+          place: ResolvedPlace;
+          weapon: string;
+          weaponRaw: string | null;
+        }> = [];
+        let firstKey: string | null = null;
 
-        this.logger.log(
-          `msg ${item.dbId} @${item.channel} threat=${analysis.isThreat} type=${analysis.threatType ?? '-'} ` +
-            `lost=${analysis.trackLost} chain=${chain?.context.length ?? 0} ` +
-            `places=[${analysis.places.join(', ')}] resolved=[${places.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
-            `foreign=[${resolved.foreign.join(', ')}] unknown=[${resolved.unknown.join(', ')}] ` +
-            `key=${storedKey ?? '-'}`,
-        );
-
-        await this.persistAnalysis(item.dbId, analysis, storedKey);
-
-        if (places.length) {
-          await this.prisma.threatPlace.deleteMany({ where: { messageId: item.dbId } });
-          await this.prisma.threatPlace.createMany({
-            data: places.map((p) => ({
-              messageId: item.dbId,
-              name: p.name,
-              lat: p.lat,
-              lon: p.lon,
-              oblastCode: p.code,
-              matchType: p.matchType,
-            })),
+        for (const event of events) {
+          const resolved = await this.geo.resolveThreatPlaces({
+            text: placeText,
+            locations: [{ name: event.name, kind: event.kind }],
           });
-        }
+          let places = [...resolved.places];
 
-        if (!analysis.notify) continue;
-        if (analysis.threatType === 'all_clear' && !isAllClearPost(item.text)) {
-          this.logger.log(`msg ${item.dbId} all_clear without відбій/отбой, skip`);
-          continue;
-        }
-        if (resolved.foreign.length && places.length === 0) {
-          this.logger.log(`msg ${item.dbId} other city [${resolved.foreign.join(', ')}], skip`);
-          continue;
-        }
-        if (places.length === 0) {
-          const guesses = (analysis.places.length ? analysis.places : resolved.unknown).filter(
-            (name) => isPlausiblePlaceLabel(name) && !isThreatLabel(name),
-          );
-          if (!guesses.length && isCityWideKharkivCue(item.text)) {
-            const cityWide = await this.geo.resolveAndLearn(['Харків']);
-            if (cityWide.length) {
-              places.push(...cityWide);
+          if (event.weapon === 'all_clear' && !places.some((p) => p.matchType === 'city')) {
+            const city = this.geo.findPlace('Харків', 'city');
+            if (city) {
+              places = [
+                {
+                  name: city.name,
+                  lat: city.lat,
+                  lon: city.lon,
+                  code: city.norm,
+                  matchType: city.kind,
+                },
+              ];
             }
           }
-          if (places.length === 0) {
-            this.logger.warn(`msg ${item.dbId} threat without resolved places, skip alert`);
-            if (guesses.length) {
+
+          this.logger.log(
+            `msg ${item.dbId} @${item.channel} event weapon=${event.weapon} raw=${event.weaponRaw ?? '-'} ` +
+              `loc=${event.name}/${event.kind} resolved=[${places.map((p) => `${p.name}/${p.matchType}`).join(', ')}] ` +
+              `foreign=[${resolved.foreign.join(', ')}] unknown=[${resolved.unknown.join(', ')}] ` +
+              `lost=${analysis.trackLost} chain=${chain?.context.length ?? 0}`,
+          );
+
+          if (!places.length) {
+            if (resolved.foreign.length) {
+              this.logger.log(`msg ${item.dbId} other city [${resolved.foreign.join(', ')}], skip pair`);
+              continue;
+            }
+            const guesses = [event.name, ...resolved.unknown].filter(
+              (name) => isPlausiblePlaceLabel(name) && !isThreatLabel(name),
+            );
+            this.logger.warn(`msg ${item.dbId} pair without resolved place, skip`);
+            if (guesses.length && analysis.notify) {
               void this.telegram.askUnknownToponym({
                 channel: item.channel,
                 text: item.text,
                 guesses,
               });
-            } else {
-              this.logger.log(`msg ${item.dbId} no plausible place guesses, skip unknown-toponym ask`);
             }
             continue;
           }
-        }
 
-        const eventKey = canonicalEventKey({
-          threatType: analysis.threatType,
-          places,
-          trackLost: analysis.trackLost,
-        });
-        if ([...deliveredEvents].some((prev) => eventKeysOverlap(prev, eventKey))) {
-          this.logger.log(`skip duplicate event_key=${eventKey} (same threat already in this batch)`);
-          continue;
-        }
+          for (const place of places) {
+            storedPlaces.push({
+              place,
+              weapon: event.weapon,
+              weaponRaw: event.weaponRaw,
+            });
+          }
 
-        if (!item.alert || Date.now() - item.date.getTime() > ALERT_MAX_AGE_MS) {
-          this.logger.log(`msg ${item.dbId} learned only (old or backlog), no push`);
-          continue;
-        }
+          const eventKey = canonicalEventKey({
+            threatType: event.weapon,
+            places,
+            trackLost: analysis.trackLost,
+          });
+          if (!firstKey) firstKey = eventKey;
 
-        const alreadySent = await this.prisma.alertDelivery.findFirst({
-          where: {
+          if (!analysis.notify) continue;
+          if (event.weapon === 'all_clear' && !isAllClearPost(item.text)) {
+            this.logger.log(`msg ${item.dbId} all_clear without відбій/отбой, skip pair`);
+            continue;
+          }
+          if ([...deliveredEvents].some((prev) => eventKeysOverlap(prev, eventKey))) {
+            this.logger.log(`skip duplicate event_key=${eventKey} (same threat already in this batch)`);
+            continue;
+          }
+          if (!item.alert || Date.now() - item.date.getTime() > ALERT_MAX_AGE_MS) {
+            this.logger.log(`msg ${item.dbId} learned only (old or backlog), no push`);
+            continue;
+          }
+
+          const alreadySent = await this.prisma.alertDelivery.findFirst({
+            where: {
+              eventKey,
+              sentAt: { gte: new Date(Date.now() - ALERT_DEDUP_MS) },
+            },
+            select: { id: true },
+          });
+          if (alreadySent) {
+            this.logger.log(`skip event_key=${eventKey} already delivered recently`);
+            continue;
+          }
+
+          deliveredEvents.add(eventKey);
+          await this.alerts.dispatch({
+            messageId: item.dbId,
+            channel: item.channel,
+            text: item.text,
+            summary: analysis.summaryUk,
             eventKey,
-            sentAt: { gte: new Date(Date.now() - ALERT_DEDUP_MS) },
-          },
-          select: { id: true },
-        });
-        if (alreadySent) {
-          this.logger.log(`skip event_key=${eventKey} already delivered recently`);
-          continue;
+            threatType: event.weapon,
+            weaponRaw: event.weaponRaw,
+            trackLost: analysis.trackLost,
+            places,
+          });
         }
 
-        deliveredEvents.add(eventKey);
+        await this.persistAnalysis(item.dbId, analysis, firstKey);
 
-        await this.alerts.dispatch({
-          messageId: item.dbId,
-          channel: item.channel,
-          text: item.text,
-          summary: analysis.summaryUk,
-          eventKey,
-          threatType: analysis.threatType,
-          trackLost: analysis.trackLost,
-          places,
-        });
+        if (storedPlaces.length) {
+          await this.prisma.threatPlace.deleteMany({ where: { messageId: item.dbId } });
+          await this.prisma.threatPlace.createMany({
+            data: storedPlaces.map(({ place, weapon, weaponRaw }) => ({
+              messageId: item.dbId,
+              name: place.name,
+              lat: place.lat,
+              lon: place.lon,
+              oblastCode: place.code,
+              matchType: place.matchType,
+              weapon,
+              weaponRaw,
+            })),
+          });
+        }
       }
     } catch (err) {
       this.logger.error(`flush failed, requeue: ${err instanceof Error ? err.message : err}`);
@@ -295,15 +279,24 @@ export class PipelineService {
     }
   }
 
+  private eventsForGeo(analysis: LlmResultItem): LlmEvent[] {
+    if (analysis.events.length) return analysis.events;
+    if (analysis.threatType === 'all_clear') {
+      return [
+        {
+          weapon: 'all_clear',
+          weaponRaw: null,
+          name: 'Харків',
+          kind: 'city' as PlaceKind,
+        },
+      ];
+    }
+    return [];
+  }
+
   private persistAnalysis(
     messageId: number,
-    analysis: {
-      isThreat: boolean;
-      severity: string | null;
-      threatType: string | null;
-      summaryUk: string | null;
-      eventKey: string | null;
-    },
+    analysis: LlmResultItem,
     eventKey: string | null,
   ) {
     return this.prisma.messageAnalysis.upsert({
@@ -311,7 +304,7 @@ export class PipelineService {
       create: {
         messageId,
         isThreat: analysis.isThreat,
-        severity: analysis.severity,
+        severity: null,
         threatType: analysis.threatType,
         summary: analysis.summaryUk,
         eventKey,
@@ -320,7 +313,7 @@ export class PipelineService {
       },
       update: {
         isThreat: analysis.isThreat,
-        severity: analysis.severity,
+        severity: null,
         threatType: analysis.threatType,
         summary: analysis.summaryUk,
         eventKey,

@@ -1,21 +1,11 @@
-import { normalize } from '../common/text';
 import type { PlaceKind } from './ua-gazetteer';
+import { foldUa } from './fold-ua';
+import { expandAliases, formMatches, placeForms } from './place-forms';
+
+export { foldUa } from './fold-ua';
+export { placeForms, expandAliases, formMatches } from './place-forms';
 
 export const OBLAST_BBOX = { minLat: 48.45, maxLat: 50.55, minLon: 34.75, maxLon: 38.15 };
-
-export function foldUa(s: string): string {
-  return normalize(s)
-    .replace(/[''`ʼ]/g, '')
-    .replace(/[ъь]/g, '')
-    .replace(/і/g, 'и')
-    .replace(/ї/g, 'и')
-    .replace(/є/g, 'е')
-    .replace(/ґ/g, 'г')
-    .replace(/ё/g, 'е')
-    .replace(/[^a-zа-я0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
 
 export const PLACE_SLANG: Record<string, string> = {
   сс: foldUa('північна салтівка'),
@@ -106,23 +96,20 @@ export function mentionedIn(text: string, name: string): boolean {
 }
 
 /**
- * Strict token↔name link: lemma / declined forms / «лозівський»→«Лозівський район».
+ * Strict token↔name link via multilingual forms (UA/RU cases).
  * Does NOT equate stem-siblings (Лозова ≠ Лозове).
  */
 export function tokenRefersToName(token: string, name: string): boolean {
   const ft = foldUa(token);
   const fl = foldUa(name);
   if (!ft || !fl) return false;
-  if (ft === fl) return true;
-  if (nominativeGuesses(token).some((g) => foldUa(g) === fl)) return true;
-  if (nominativeGuesses(name).some((g) => foldUa(g) === ft)) return true;
+  if (formMatches(token, name)) return true;
   for (const variant of placeVariants(name)) {
-    if (foldUa(variant) === ft) return true;
-    if (nominativeGuesses(token).some((g) => foldUa(g) === foldUa(variant))) return true;
+    if (formMatches(token, variant)) return true;
   }
   if (/\s+район$/.test(fl)) {
     const head = fl.replace(/\s+район$/, '');
-    if (ft === head) return true;
+    if (ft === head || formMatches(token, head)) return true;
     if (
       /(ський|ский|ська|ская|ське|ское|ській|ской)$/.test(ft) &&
       placeStem(ft) === placeStem(head)
@@ -404,29 +391,9 @@ export function isForeignOnlyThreat(text: string, extra: string[] = []): boolean
   return !hasKharkivLocalCue(text);
 }
 
+/** @deprecated use placeForms — kept as thin alias for geocode query expansion */
 export function nominativeGuesses(name: string): string[] {
-  const raw = name.trim();
-  const folded = foldUa(raw);
-  const out = new Set<string>([raw, folded].filter(Boolean));
-  if (folded.length < 5) return [...out];
-
-  if (/ського$/.test(folded)) out.add(folded.replace(/ського$/, 'ський'));
-  if (/ского$/.test(folded)) out.add(folded.replace(/ского$/, 'ский'));
-  if (/ській$/.test(folded)) out.add(folded.replace(/ській$/, 'ський'));
-  if (/ской$/.test(folded)) out.add(folded.replace(/ской$/, 'ский'));
-  if (/ою$/.test(folded)) out.add(folded.replace(/ою$/, 'а'));
-  if (/ею$/.test(folded)) out.add(folded.replace(/ею$/, 'я'));
-  if (/ом$/.test(folded)) out.add(folded.replace(/ом$/, ''));
-  if (/ем$/.test(folded)) out.add(folded.replace(/ем$/, ''));
-  if (/ах$/.test(folded)) out.add(folded.replace(/ах$/, 'и'));
-  if (/ях$/.test(folded)) out.add(folded.replace(/ях$/, 'і'));
-  if (/у$/.test(folded)) out.add(folded.replace(/у$/, 'а'));
-  if (/ю$/.test(folded)) out.add(folded.replace(/ю$/, 'я'));
-  if (/і$/.test(folded) && !/ські$|цькі$/.test(folded)) out.add(folded.replace(/і$/, 'а'));
-  if (/ї$/.test(folded)) out.add(folded.replace(/ї$/, 'я'));
-  if (/и$/.test(folded) && folded.length >= 6) out.add(folded.replace(/и$/, 'а'));
-
-  return [...out];
+  return placeForms(name);
 }
 
 function escapeRe(s: string): string {

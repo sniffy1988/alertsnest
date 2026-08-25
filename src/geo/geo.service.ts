@@ -2,18 +2,11 @@ import { Injectable } from '@nestjs/common';
 import { KHARKIV_CENTER, type PlaceKind } from './ua-gazetteer';
 import { ToponymService, type MemoryToponym } from './toponym.service';
 import {
-  detectOblastRegion,
-  dropStemSiblings,
-  dropStreetShadows,
-  findOutsideCities,
   foldUa,
-  isCityWideKharkivCue,
+  inKharkivOblast,
   isPlausiblePlaceLabel,
   isVagueOblastName,
   mentionedIn,
-  mentionsAdminRaion,
-  preferRaionOverStemSiblings,
-  queryLooksLikeStreet,
 } from './place-match';
 import { isThreatLabel } from '../llm/threat-slang';
 
@@ -31,14 +24,15 @@ export type ThreatPlaceResolve = {
   unknown: string[];
 };
 
-const CITY_RADIUS_KM = 22;
-const NEARBY_KM: Record<PlaceKind, number> = {
-  street: 1.2,
-  district: 2,
-  city: 8,
-  settlement: 3,
-  region: 4,
+export type LlmLocationInput = {
+  name: string;
+  kind: PlaceKind;
 };
+
+const CITY_RADIUS_KM = 22;
+const DEFAULT_USER_RADIUS_KM = 40;
+const MIN_USER_RADIUS_KM = 5;
+const MAX_USER_RADIUS_KM = 150;
 
 @Injectable()
 export class GeoService {
@@ -60,137 +54,82 @@ export class GeoService {
   }
 
   resolveUserArea(lat: number, lon: number): { oblastCode: string; label: string } {
-    if (!this.isInKharkiv(lat, lon)) {
-      return { oblastCode: 'outside', label: 'поза Харковом' };
+    if (!inKharkivOblast(lat, lon)) {
+      return { oblastCode: 'outside', label: 'поза Харківською областю' };
     }
-    const street = this.nearestOfKind(lat, lon, 'street');
-    const district = this.nearestOfKind(lat, lon, 'district');
+    if (this.isInKharkiv(lat, lon)) {
+      const street = this.nearestOfKind(lat, lon, 'street');
+      const district = this.nearestOfKind(lat, lon, 'district');
+      return {
+        oblastCode: district?.norm ?? street?.norm ?? 'kharkiv',
+        label: [street?.name, district?.name].filter(Boolean).join(', ') || 'Харків',
+      };
+    }
+    const settlement = this.nearestOfKind(lat, lon, 'settlement');
+    const region = this.nearestOfKind(lat, lon, 'region');
     return {
-      oblastCode: district?.norm ?? street?.norm ?? 'kharkiv',
-      label: [street?.name, district?.name].filter(Boolean).join(', ') || 'Харків',
+      oblastCode: settlement?.norm ?? region?.norm ?? 'oblast',
+      label: settlement?.name ?? region?.name ?? 'Харківська область',
     };
   }
 
+  userRadiusKm(radiusKm?: number | null): number {
+    const raw = Number.isFinite(radiusKm) ? Number(radiusKm) : DEFAULT_USER_RADIUS_KM;
+    return Math.min(MAX_USER_RADIUS_KM, Math.max(MIN_USER_RADIUS_KM, raw));
+  }
+
+  /** Resolve only LLM-provided location names (no full-text gazetteer scan). */
   async resolveThreatPlaces(input: {
     text: string;
-    llmPlaces: string[];
-    oblast?: string | null;
-    geoScope?: string | null;
+    locations: LlmLocationInput[];
   }): Promise<ThreatPlaceResolve> {
-    const region = detectOblastRegion(input.text);
-    const raionOnly = mentionsAdminRaion(input.text);
-    const llmPlaces = input.llmPlaces.filter(
-      (name) => isPlausiblePlaceLabel(name) && !isThreatLabel(name),
-    );
-    const fromText = dropStreetShadows(
-      this.toponyms.findInText(input.text).filter((p) => !raionOnly || p.kind !== 'street'),
-      input.text,
-    );
-    const groundedLlm = llmPlaces.filter(
-      (name) => !isVagueOblastName(name) && mentionedIn(input.text, name),
-    );
-    const lookedUp = dropStreetShadows(
-      llmPlaces
-        .filter((name) => !isVagueOblastName(name))
-        .map((name) => this.toponyms.lookup(name))
-        .filter((hit): hit is NonNullable<typeof hit> => hit != null && mentionedIn(input.text, hit.name))
-        .filter((hit) => !raionOnly || hit.kind !== 'street'),
-      input.text,
-    );
-
-    const foreign = findOutsideCities(input.text, llmPlaces);
-    const names: string[] = [];
-    names.push(...fromText.map((p) => p.name));
-    names.push(...lookedUp.map((p) => p.name));
-    names.push(
-      ...groundedLlm.filter(
-        (name) =>
-          isPlausiblePlaceLabel(name) &&
-          !isThreatLabel(name) &&
-          !this.toponyms.lookup(name) &&
-          !findOutsideCities(name).length,
-      ),
-    );
-    if (region) names.unshift(region.name);
-    if (input.oblast && !isVagueOblastName(input.oblast) && mentionedIn(input.text, input.oblast)) {
-      names.push(input.oblast);
-    }
-
-    const uniqueNames = [
-      ...new Set(
-        names
-          .map((n) => n.trim())
-          .filter((n) => n.length >= 3 && isPlausiblePlaceLabel(n) && !isThreatLabel(n)),
-      ),
-    ];
-    const known = uniqueNames
-      .map((name) => this.toponyms.lookup(name))
-      .filter((hit): hit is NonNullable<typeof hit> => hit != null);
-    const hint =
-      known.find((p) => p.kind === 'settlement' || p.kind === 'region' || p.kind === 'district') ??
-      known[0] ??
-      this.toponyms.lookup('Харків');
-    const learned = uniqueNames.length ? await this.toponyms.learn(uniqueNames, hint) : [];
-    const unique = new Map<number, ResolvedPlace>();
+    const foreign: string[] = [];
     const unknown: string[] = [];
-    for (const item of learned) {
-      if (item.status === 'local') unique.set(item.place.id, this.toResolved(item.place));
-      else if (item.status === 'foreign') foreign.push(item.label);
-      else if (isPlausiblePlaceLabel(item.label) && !isThreatLabel(item.label)) unknown.push(item.label);
-    }
-    if (region && ![...unique.values()].some((p) => p.code === region.code || p.matchType === 'region')) {
-      unique.set(-1, {
-        name: region.name,
-        lat: region.lat,
-        lon: region.lon,
-        code: region.code,
-        matchType: 'region',
-      });
-    }
+    const unique = new Map<string, ResolvedPlace>();
 
-    let places = dropStreetShadows([...unique.values()], input.text);
-    places = this.dropCityAdjectiveStreets(places, input.text);
-    places = preferRaionOverStemSiblings(places, input.text);
-    places = dropStemSiblings(places, input.text);
-    const groundedPlaces = places.filter((p) => mentionedIn(input.text, p.name));
-    if (groundedPlaces.length) places = groundedPlaces;
+    for (const loc of input.locations) {
+      const name = loc.name.trim();
+      if (name.length < 2 || isVagueOblastName(name) || isThreatLabel(name)) continue;
+      if (!isPlausiblePlaceLabel(name)) continue;
+      if (!this.isGrounded(input.text, name, loc.kind)) continue;
 
-    const cityPlacesInText = fromText.some((p) => p.kind === 'street' || p.kind === 'district');
-    const precise = places.filter((p) => p.matchType !== 'city');
-    if (precise.length) places = precise;
-    if (!cityPlacesInText && (input.geoScope === 'oblast' || input.geoScope === 'suburb' || region)) {
-      const outer = places.filter((p) => p.matchType === 'settlement' || p.matchType === 'region');
-      if (outer.length) places = outer;
-    }
+      const lookedUp = this.toponyms.lookup(name, loc.kind);
+      if (lookedUp) {
+        unique.set(lookedUp.norm, this.toResolved(lookedUp));
+        continue;
+      }
 
-    const cityWide =
-      isCityWideKharkivCue(input.text) ||
-      (input.geoScope === 'city' && /харк|харьков|kharkiv/i.test(foldUa(input.text)));
-
-    if (!places.length && cityWide) {
-      const city = this.toponyms.lookup('Харків');
-      if (city) places = [this.toResolved(city)];
+      const hint =
+        this.toponyms.lookup('Харків', 'city') ?? this.toponyms.lookup('Харків');
+      const [learned] = await this.toponyms.learn([name], hint, loc.kind);
+      if (!learned) {
+        if (isPlausiblePlaceLabel(name)) unknown.push(name);
+        continue;
+      }
+      if (learned.status === 'local') unique.set(learned.place.norm, this.toResolved(learned.place));
+      else if (learned.status === 'foreign') foreign.push(learned.label);
+      else if (isPlausiblePlaceLabel(learned.label) && !isThreatLabel(learned.label)) {
+        unknown.push(learned.label);
+      }
     }
 
     return {
-      places,
+      places: [...unique.values()],
       foreign: [...new Set(foreign)],
       unknown: [...new Set(unknown)],
     };
   }
 
-  /** «Харківська вулиця» from geocoding «Харківська» — not a real street mention. */
-  private dropCityAdjectiveStreets(places: ResolvedPlace[], text: string): ResolvedPlace[] {
-    if (queryLooksLikeStreet(text)) return places;
-    return places.filter((place) => {
-      if (place.matchType !== 'street') return true;
-      const n = foldUa(place.name);
-      return !/^(вул\.?\s*)?(харківськ|харьковск)/.test(n);
+  async resolveAndLearn(
+    locations: Array<{ name: string; kind?: PlaceKind | null }>,
+  ): Promise<ResolvedPlace[]> {
+    const resolved = await this.resolveThreatPlaces({
+      text: locations.map((l) => l.name).join(' '),
+      locations: locations.map((l) => ({
+        name: l.name,
+        kind: l.kind ?? 'settlement',
+      })),
     });
-  }
-
-  async resolveAndLearn(names: string[], oblast?: string | null): Promise<ResolvedPlace[]> {
-    const resolved = await this.resolveThreatPlaces({ text: names.join(' '), llmPlaces: names, oblast });
     return resolved.places;
   }
 
@@ -199,15 +138,23 @@ export class GeoService {
     return this.toponyms.lookup(code)?.name ?? code;
   }
 
-  findPlace(raw: string) {
-    return this.toponyms.lookup(raw);
+  findPlace(raw: string, kind?: PlaceKind | null) {
+    return this.toponyms.lookup(raw, kind);
   }
 
   nearestDistrictNorm(lat: number, lon: number): string | null {
     return this.nearestOfKind(lat, lon, 'district')?.norm ?? null;
   }
 
-  private nearestOfKind(lat: number, lon: number, kind: 'street' | 'district') {
+  /** City default (Харків) may be injected by LLM without appearing in text. */
+  private isGrounded(text: string, name: string, kind: PlaceKind): boolean {
+    if (kind === 'city' && /^(харків|харьков|kharkiv|kharkov)$/i.test(foldUa(name))) {
+      return true;
+    }
+    return mentionedIn(text, name);
+  }
+
+  private nearestOfKind(lat: number, lon: number, kind: PlaceKind) {
     let best: { name: string; norm: string } | null = null;
     let bestKm = Infinity;
     for (const place of this.toponyms.all()) {
@@ -232,22 +179,27 @@ export class GeoService {
   }
 
   matchUser(
-    user: { lat: number | null; lon: number | null; oblastCode: string | null },
+    user: { lat: number | null; lon: number | null; oblastCode: string | null; radiusKm?: number | null },
     places: ResolvedPlace[],
     opts?: { cityWide?: boolean },
-  ): { ok: boolean; km?: number; place?: ResolvedPlace } {
-    if (user.lat != null && user.lon != null && !this.isInKharkiv(user.lat, user.lon)) {
+  ): { ok: boolean; km?: number; place?: ResolvedPlace; radiusKm?: number } {
+    if (user.lat != null && user.lon != null) {
+      if (!inKharkivOblast(user.lat, user.lon)) return { ok: false };
+    } else if (user.oblastCode === 'outside') {
       return { ok: false };
     }
-    if (user.oblastCode === 'outside') return { ok: false };
 
     const lat = user.lat ?? KHARKIV_CENTER.lat;
     const lon = user.lon ?? KHARKIV_CENTER.lon;
+    const radiusKm = this.userRadiusKm(user.radiusKm);
 
     if (opts?.cityWide) {
+      const km = this.haversineKm(lat, lon, KHARKIV_CENTER.lat, KHARKIV_CENTER.lon);
+      const inCity = this.isInKharkiv(lat, lon);
       return {
-        ok: true,
-        km: this.haversineKm(lat, lon, KHARKIV_CENTER.lat, KHARKIV_CENTER.lon),
+        ok: inCity || km <= radiusKm,
+        km,
+        radiusKm,
         place: places.find((p) => p.matchType === 'city') ?? {
           name: 'Харків',
           lat: KHARKIV_CENTER.lat,
@@ -258,19 +210,18 @@ export class GeoService {
       };
     }
 
-    if (places.length === 0) return { ok: false };
+    if (places.length === 0) return { ok: false, radiusKm };
 
     let best: { km: number; place: ResolvedPlace } | null = null;
     for (const place of places) {
       const km = this.haversineKm(lat, lon, place.lat, place.lon);
       if (!best || km < best.km) best = { km, place };
     }
-    if (!best) return { ok: false };
+    if (!best) return { ok: false, radiusKm };
 
-    const limit = NEARBY_KM[best.place.matchType] ?? 4;
-    if (best.km <= limit) {
-      return { ok: true, km: best.km, place: best.place };
+    if (best.km <= radiusKm) {
+      return { ok: true, km: best.km, place: best.place, radiusKm };
     }
-    return { ok: false, km: best.km, place: best.place };
+    return { ok: false, km: best.km, place: best.place, radiusKm };
   }
 }

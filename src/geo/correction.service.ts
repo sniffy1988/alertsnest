@@ -87,10 +87,20 @@ export class CorrectionService {
     const out = new Set<string>(message.places.map((p) => p.name.trim()).filter((s) => s.length >= 2));
     if (message.analysis?.rawJson) {
       try {
-        const raw = JSON.parse(message.analysis.rawJson) as { places?: unknown };
+        const raw = JSON.parse(message.analysis.rawJson) as {
+          places?: unknown;
+          events?: Array<{ name?: unknown }>;
+        };
         if (Array.isArray(raw.places)) {
           for (const item of raw.places) {
             if (typeof item === 'string' && item.trim().length >= 2) out.add(item.trim());
+          }
+        }
+        if (Array.isArray(raw.events)) {
+          for (const item of raw.events) {
+            if (typeof item?.name === 'string' && item.name.trim().length >= 2) {
+              out.add(item.name.trim());
+            }
           }
         }
       } catch {

@@ -63,6 +63,8 @@ model ThreatPlace {
   lon        Float?
   oblastCode String?
   matchType  String
+  weapon     String?
+  weaponRaw  String?
 }
 
 model User {

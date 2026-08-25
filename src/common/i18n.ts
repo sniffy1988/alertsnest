@@ -20,7 +20,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     area_unknown: "Не знайшов «{name}» у словнику Харкова. Спробуйте іншу назву: Центр, Наукова, Салтівка.",
     location_saved: "Місце збережено: {oblast}.",
     location_saved_no_oblast:
-      "Точка поза Харковом. Надішліть геолокацію в межах міста.",
+      "Точка поза Харківською областю. Надішліть геолокацію в межах області.",
     settings_title: "⚙️ Налаштування",
     settings_silent_mode: "Беззвучний режим: {status}",
     settings_toggle_silent_on: "🔇 Увімкнути беззвучний режим",
@@ -114,7 +114,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     area_unknown: "Не нашёл «{name}» в словаре Харькова. Попробуйте: Центр, Научная, Салтовка.",
     location_saved: "Место сохранено: {oblast}.",
     location_saved_no_oblast:
-      "Точка вне Харькова. Отправьте геолокацию в пределах города.",
+      "Точка вне Харьковской области. Отправьте геолокацию в пределах области.",
     settings_title: "⚙️ Настройки",
     settings_silent_mode: "Беззвучный режим: {status}",
     settings_toggle_silent_on: "🔇 Включить беззвучный режим",
@@ -208,7 +208,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     area_unknown: "Could not find “{name}”. Try: Center, Naukova, Saltivka.",
     location_saved: "Place saved: {oblast}.",
     location_saved_no_oblast:
-      "Point is outside Kharkiv. Share a location inside the city.",
+      "Point is outside Kharkiv oblast. Share a location inside the oblast.",
     settings_title: "⚙️ Settings",
     settings_silent_mode: "Silent mode: {status}",
     settings_toggle_silent_on: "🔇 Enable silent mode",
